@@ -3,7 +3,7 @@
 import { PollTimeoutError, TaskFailedError } from "./errors.js";
 import { CreatedTask, Task, TaskPage } from "./models.js";
 import type { JSONObject } from "./models.js";
-import { IDEMPOTENCY_KEY_HEADER, sleep, Transport } from "./transport.js";
+import { IDEMPOTENCY_KEY_HEADER, MAX_TIMER_DELAY_MS, sleep, Transport } from "./transport.js";
 
 export const DEFAULT_POLL_INTERVAL_MS = 3_000;
 export const DEFAULT_POLL_TIMEOUT_MS = 600_000;
@@ -65,10 +65,11 @@ export interface WaitOptions {
   /** Called once per status change while waiting; receives the latest Task. */
   onUpdate?: (task: Task) => void;
   /**
-   * Aborts the poll loop (not the task) when triggered. Checked between polls
-   * and before each `retrieve` call — not forwarded into the in-flight HTTP
-   * request, so aborting while a poll's request is already underway lets that
-   * one request finish before the loop stops.
+   * Aborts the poll loop (not the task) when triggered. Not forwarded into
+   * the in-flight HTTP request, so aborting while a `retrieve` call is
+   * already underway lets that one request finish — but the abort is then
+   * honoured immediately once it resolves, before `onUpdate` fires or a
+   * terminal result is returned/thrown.
    */
   signal?: AbortSignal;
 }
@@ -140,14 +141,16 @@ export class Tasks {
    * Poll `taskId` until it reaches a terminal state.
    *
    * Resolves with the {@link Task} on `success`. Throws
-   * {@link TaskFailedError} on `fail` and {@link PollTimeoutError} once
-   * `timeoutMs` milliseconds have elapsed *between polls*: the deadline is
-   * re-checked once per iteration, right after each `retrieve` call resolves
-   * and before starting the next one — so it can't cut off a call already in
-   * flight, and a slow individual request (network retries, a large
-   * `Retry-After`) can push the actual wall-clock time somewhat past
-   * `timeoutMs` before that's caught. It is a budget for the polling loop,
-   * not a hard per-call cutoff.
+   * {@link TaskFailedError} on `fail`. Throws {@link PollTimeoutError} once
+   * `timeoutMs` milliseconds have elapsed *between polls* — but only if the
+   * task is still non-terminal at that point: the deadline is checked once
+   * per iteration, after `retrieve` resolves and only once success/fail have
+   * already been ruled out, so a task that actually finished is always
+   * returned/thrown rather than discarded for being "late". A slow
+   * individual request (network retries, a large `Retry-After`) can
+   * similarly push the actual wall-clock time somewhat past `timeoutMs`
+   * before a timeout is caught. It is a budget for the polling loop, not a
+   * hard per-call cutoff.
    */
   async wait(taskId: string, options: WaitOptions = {}): Promise<Task> {
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -155,13 +158,18 @@ export class Tasks {
     // Inverted comparisons (rather than `<= 0` / `< 0`) so a NaN value fails
     // the check too — a bare `NaN <= 0` is `false`, which would otherwise let
     // NaN slip through and turn the loop below into a zero-delay busy poll.
-    // pollIntervalMs must additionally be finite (unlike timeoutMs, which may
-    // be Infinity to mean "no timeout"): confirmed via `node -e` that
-    // `setTimeout(fn, Infinity)` does NOT wait forever — Node clamps it to
-    // 1ms (with a TimeoutOverflowWarning), which would turn an "infinite
-    // interval" into the same zero-delay busy-poll NaN causes.
-    if (!Number.isFinite(pollIntervalMs) || !(pollIntervalMs > 0)) {
-      throw new RangeError("pollIntervalMs must be a finite number > 0");
+    // pollIntervalMs must additionally be finite and within Node's real timer
+    // range (unlike timeoutMs, which may be Infinity to mean "no timeout"):
+    // confirmed via `node -e` that both `Infinity` and values above
+    // MAX_TIMER_DELAY_MS get silently clamped to ~1ms rather than waited out
+    // in full, which would turn a large/infinite interval into the same
+    // zero-delay busy-poll NaN causes.
+    if (
+      !Number.isFinite(pollIntervalMs) ||
+      !(pollIntervalMs > 0) ||
+      pollIntervalMs > MAX_TIMER_DELAY_MS
+    ) {
+      throw new RangeError(`pollIntervalMs must be a finite number in (0, ${MAX_TIMER_DELAY_MS}]`);
     }
     if (!(timeoutMs >= 0)) {
       throw new RangeError("timeoutMs must be >= 0");
@@ -171,6 +179,11 @@ export class Tasks {
     for (;;) {
       options.signal?.throwIfAborted();
       const task = await this.retrieve(taskId);
+      // Re-checked here, not just at the top of the loop: the signal could
+      // have been aborted while the `await` above was in flight, and without
+      // this the abort wouldn't be honoured until after onUpdate fires and a
+      // terminal result (if any) is fully returned/thrown.
+      options.signal?.throwIfAborted();
       if (options.onUpdate && task.status !== lastStatus) {
         lastStatus = task.status;
         options.onUpdate(task);

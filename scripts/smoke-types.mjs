@@ -23,8 +23,13 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const PACKAGE_ROOT = new URL("..", import.meta.url).pathname;
+// `.pathname`, not used here on purpose: it keeps percent-encoding (e.g. a
+// space becomes `%20`) and yields a leading-slash path on Windows (e.g.
+// `/C:/...`) that isn't a valid filesystem path — fileURLToPath() decodes
+// and normalizes correctly on every platform.
+const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const TSC = join(PACKAGE_ROOT, "node_modules/.bin/tsc");
 
 const CONSUMER_SOURCE = `

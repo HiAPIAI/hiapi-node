@@ -74,10 +74,15 @@ describe("tasks.create", () => {
     assert.equal(mock.requests[0].headers["idempotency-key"], undefined);
   });
 
-  // Compile-time regression check for a real tsc error (models.ts JSONObject):
-  // a plain named interface, with no `[key: string]: unknown` index signature,
-  // must be assignable to `input` without a cast — `pretest` type-checks this
-  // file, so reverting the generic on CreateTaskParams breaks the build here.
+  // Compile-time regression check for a real tsc error this SDK shipped with
+  // earlier: a plain named interface, with no `[key: string]: unknown` index
+  // signature, must be assignable to `input` without a cast at a direct call
+  // site — `pretest` type-checks this file, so this only catches
+  // `input: object` regressing back to an index-signature type. It does NOT
+  // cover the pre-declared-`CreateTaskParams`-variable case (a generic
+  // default type parameter passes here too, since inference applies at a
+  // call site regardless) — that regression is caught by
+  // scripts/smoke-types.mjs instead.
   interface SeedanceInput {
     prompt: string;
     resolution: string;

@@ -6,7 +6,7 @@ The package builds ESM + CJS + type declarations via `prepack`, so a plain
 ## First release (manual)
 
 ```bash
-# 1. Sanity: build + 73 tests, dual-entry smoke.
+# 1. Sanity: unit tests + build + ESM/CJS/types smoke checks.
 npm test
 
 # 2. Log in once on this machine (needs the npm account that owns the name).

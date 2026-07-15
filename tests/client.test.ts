@@ -53,20 +53,23 @@ describe("client construction", () => {
   });
 
   test("rejects an invalid timeoutMs or maxRetries at construction, not on first request", () => {
-    // 0.5 and 4294967296 (2^32) are real, verified failures of Node's own
-    // AbortSignal.timeout(): the first because it requires an integer, the
-    // second because it exceeds the 32-bit unsigned max Node's timers accept
-    // — both throw a confusing RangeError deep inside the request loop if
-    // timeoutMs isn't validated up front at construction time instead.
-    for (const timeoutMs of [NaN, Infinity, -1, 0, 0.5, 4_294_967_296]) {
+    // 0.5 fails Node's own AbortSignal.timeout() (requires an integer).
+    // 3_000_000_000 is the genuinely dangerous case, not merely a boundary
+    // nitpick: it's well within the 32-bit UNSIGNED max (4294967295) that
+    // AbortSignal.timeout()'s own validation allows, but Node's underlying
+    // timer uses a SIGNED 32-bit int — verified via `node -e` that this
+    // value passes validation yet the timer still fires within ~50ms instead
+    // of ~35 days later, i.e. it's silently clamped, not honoured.
+    for (const timeoutMs of [NaN, Infinity, -1, 0, 0.5, 3_000_000_000]) {
       assert.throws(() => new HiAPI({ apiKey: "sk-test", timeoutMs }), RangeError, `timeoutMs=${timeoutMs}`);
     }
     for (const maxRetries of [NaN, Infinity]) {
       assert.throws(() => new HiAPI({ apiKey: "sk-test", maxRetries }), RangeError, `maxRetries=${maxRetries}`);
     }
-    // Sanity: valid values, including the exact upper bound, still construct fine.
+    // Sanity: valid values, including the exact (signed 32-bit) upper bound,
+    // still construct fine.
     assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", timeoutMs: 1000, maxRetries: 0 }));
-    assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", timeoutMs: 4_294_967_295 }));
+    assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", timeoutMs: 2_147_483_647 }));
   });
 
   test("a custom fetch implementation is used for requests", async () => {

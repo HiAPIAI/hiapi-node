@@ -33,10 +33,17 @@ export const IDEMPOTENCY_PROCESSING_CODE = "IDEMPOTENCY_KEY_PROCESSING";
 
 const MAX_BACKOFF_MS = 8_000;
 const MAX_RETRY_AFTER_MS = 60_000;
-// The largest delay Node's timers (and AbortSignal.timeout) accept — verified
-// via `node -e`: AbortSignal.timeout(4294967296) throws RangeError, and
-// non-integer delays like 0.5 throw too ("must be an integer").
-const MAX_TIMER_DELAY_MS = 4_294_967_295;
+// The largest delay Node's timers actually honour without clamping. NOT the
+// 4294967295 (2^32-1, unsigned 32-bit max) that AbortSignal.timeout()'s own
+// input validation allows through — that's a red herring: Node's underlying
+// timer implementation uses a SIGNED 32-bit int, so a delay between
+// 2147483648 and 4294967295 passes validation but still gets silently
+// clamped to ~1ms (verified via `node -e`: AbortSignal.timeout(3_000_000_000)
+// fires within 50ms instead of ~50 minutes later). 2147483647 (2^31-1) is the
+// real, safe boundary — this was a genuine mistake in an earlier revision.
+// Exported so tasks.ts's pollIntervalMs validation (same underlying risk,
+// via plain setTimeout in sleep()) uses the identical, single-sourced value.
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export type FetchLike = typeof fetch;
 
