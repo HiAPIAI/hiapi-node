@@ -1,8 +1,10 @@
-// Exercises the REAL published "exports" map (ESM condition) via Node's
-// self-reference resolution — importing the package by its own name, not a
-// relative src/ path — so a broken exports map, a stale dist/esm build, or a
-// missing d.ts condition would fail this the same way it would for a real
-// consumer. See package.json "test" script: this runs after `npm run build`.
+// Exercises the REAL published "exports" map's runtime ("import") condition
+// via Node's self-reference resolution — importing the package by its own
+// name, not a relative src/ path — so a broken exports map or a stale
+// dist/esm build fails this the same way it would for a real consumer. This
+// does NOT check the "types" condition (Node's loader never reads it — only
+// tsc does); see scripts/smoke-types.mjs for that. Runs after `npm run build`
+// (see package.json "smoke").
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 

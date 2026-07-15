@@ -68,7 +68,13 @@ export function verifyWebhook(body: string | Uint8Array, opts: VerifyWebhookOpti
   const ts = Number(timestamp.trim());
 
   if (tolerance) {
+    // Same fail-open shape as tolerance: a NaN `now` override would make the
+    // `> tolerance` comparison below always false (any comparison with NaN
+    // is), silently accepting a timestamp of any age.
     const current = opts.now ?? Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(current)) {
+      throw new WebhookVerificationError(`now must be a finite number, got ${current}`);
+    }
     if (Math.abs(current - ts) > tolerance) {
       throw new WebhookVerificationError(
         "timestamp outside the allowed tolerance (possible replay)",
@@ -88,7 +94,13 @@ export function verifyWebhook(body: string | Uint8Array, opts: VerifyWebhookOpti
 
   let payload: unknown;
   try {
-    payload = JSON.parse(bodyBytes.toString("utf8"));
+    // `fatal: true` — a plain `bodyBytes.toString("utf8")` silently replaces
+    // invalid byte sequences with U+FFFD instead of throwing (confirmed via
+    // `node -e`), which could let a signature-verified-but-malformed payload
+    // through with corrupted field values rather than being rejected, the
+    // way Python's `.decode("utf-8")` (strict by default) already is.
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bodyBytes);
+    payload = JSON.parse(text);
   } catch (err) {
     throw new WebhookVerificationError(
       `verified body is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,

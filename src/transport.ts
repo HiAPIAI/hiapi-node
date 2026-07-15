@@ -33,6 +33,10 @@ export const IDEMPOTENCY_PROCESSING_CODE = "IDEMPOTENCY_KEY_PROCESSING";
 
 const MAX_BACKOFF_MS = 8_000;
 const MAX_RETRY_AFTER_MS = 60_000;
+// The largest delay Node's timers (and AbortSignal.timeout) accept — verified
+// via `node -e`: AbortSignal.timeout(4294967296) throws RangeError, and
+// non-integer delays like 0.5 throw too ("must be an integer").
+const MAX_TIMER_DELAY_MS = 4_294_967_295;
 
 export type FetchLike = typeof fetch;
 
@@ -56,13 +60,20 @@ export class Transport {
     maxRetries: number,
     fetchImpl?: FetchLike,
   ) {
-    // Fail fast and clearly at construction time. Left unvalidated, a NaN or
-    // Infinity timeoutMs throws deep inside AbortSignal.timeout() on every
-    // attempt (surfacing as a misleading APIConnectionError after wasted
-    // retries), and an Infinity maxRetries turns a persistent 429/503/network
-    // failure into an infinite retry loop.
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-      throw new RangeError(`timeoutMs must be a finite number > 0, got ${timeoutMs}`);
+    // Fail fast and clearly at construction time. Left unvalidated, a bad
+    // timeoutMs (NaN, non-integer, or out of Node's timer range) throws deep
+    // inside AbortSignal.timeout() on every attempt (surfacing as a
+    // misleading APIConnectionError after wasted retries), and an Infinity
+    // maxRetries turns a persistent 429/503/network failure into an infinite
+    // retry loop.
+    if (
+      !Number.isInteger(timeoutMs) ||
+      timeoutMs <= 0 ||
+      timeoutMs > MAX_TIMER_DELAY_MS
+    ) {
+      throw new RangeError(
+        `timeoutMs must be an integer in (0, ${MAX_TIMER_DELAY_MS}], got ${timeoutMs}`,
+      );
     }
     if (!Number.isFinite(maxRetries)) {
       throw new RangeError(`maxRetries must be a finite number, got ${maxRetries}`);
@@ -104,9 +115,19 @@ export class Transport {
       headers["Content-Type"] = "application/json";
     }
     Object.assign(headers, opts.extraHeaders);
-    // An Idempotency-Key makes the POST safe to retry: the server collapses
-    // duplicates of the same key+body into the first task.
-    const hasIdempotencyKey = Boolean(opts.extraHeaders?.[IDEMPOTENCY_KEY_HEADER]);
+    // A whitespace-only key (e.g. " ") is truthy as a plain string, but HTTP
+    // strips leading/trailing whitespace from header values on the wire, so
+    // the server would see an empty value and treat it as "no key" — trimmed
+    // here, at the single point every caller's request funnels through, so a
+    // future resource can't reintroduce the "retries a non-idempotent POST"
+    // risk by skipping this check the way a per-caller trim would allow.
+    const idempotencyKey = opts.extraHeaders?.[IDEMPOTENCY_KEY_HEADER]?.trim();
+    const hasIdempotencyKey = Boolean(idempotencyKey);
+    if (idempotencyKey) {
+      headers[IDEMPOTENCY_KEY_HEADER] = idempotencyKey;
+    } else {
+      delete headers[IDEMPOTENCY_KEY_HEADER];
+    }
     const retryOnNetworkError =
       IDEMPOTENT_METHODS.has(method.toUpperCase()) || hasIdempotencyKey;
 

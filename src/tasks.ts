@@ -8,19 +8,22 @@ import { IDEMPOTENCY_KEY_HEADER, sleep, Transport } from "./transport.js";
 export const DEFAULT_POLL_INTERVAL_MS = 3_000;
 export const DEFAULT_POLL_TIMEOUT_MS = 600_000;
 
-export interface CreateTaskParams<TInput extends object = Record<string, unknown>> {
+export interface CreateTaskParams {
   model: string;
   /**
    * The model's business parameters (fields vary per model). Do not put
    * callback/webhook fields inside `input` — pass `callback` separately or
    * the request is rejected.
    *
-   * Typed as a generic `object` (not `Record<string, unknown>` directly) so a
-   * plain named `interface` — which TypeScript does not consider structurally
-   * assignable to an index-signature type without an explicit `[key: string]:
-   * unknown` — can be passed here without a cast.
+   * Typed as plain `object` (not `Record<string, unknown>`) so a named
+   * `interface` — which TypeScript does not consider structurally assignable
+   * to an index-signature type without an explicit `[key: string]: unknown` —
+   * can be passed here without a cast, including through a pre-declared
+   * `CreateTaskParams`-typed variable (a generic default type parameter only
+   * helps at a direct call site, where inference can override it; a plain
+   * `object` constraint has no such gap).
    */
-  input: TInput;
+  input: object;
   /** Webhook target, e.g. `{ url: "https://...", when: "final" }`. */
   callback?: JSONObject;
   /**
@@ -30,6 +33,14 @@ export interface CreateTaskParams<TInput extends object = Record<string, unknown
    * unknown route is rejected with a 400 listing the available routes.
    */
   route?: string;
+  /**
+   * Output storage tier: `"temp"` (default, kept ~7 days) or `"persistent"`
+   * (kept long-term, billed by size). Insufficient balance or exceeding your
+   * storage cap silently downgrades to `"temp"` — the actual tier used is
+   * reflected on the task detail response (`Task.storage`). Can also be
+   * promoted after the fact; see the Output Storage docs.
+   */
+  storage?: "temp" | "persistent";
   /**
    * Sent as the `Idempotency-Key` header (at most 255 bytes); makes retries
    * safe. Resending the same key + body returns the original task
@@ -62,8 +73,7 @@ export interface WaitOptions {
   signal?: AbortSignal;
 }
 
-export type RunParams<TInput extends object = Record<string, unknown>> = CreateTaskParams<TInput> &
-  WaitOptions;
+export type RunParams = CreateTaskParams & WaitOptions;
 
 export interface ListParams {
   page?: number;
@@ -78,9 +88,7 @@ export class Tasks {
   }
 
   /** Submit a task and return immediately with its `taskId`. */
-  async create<TInput extends object = Record<string, unknown>>(
-    params: CreateTaskParams<TInput>,
-  ): Promise<CreatedTask> {
+  async create(params: CreateTaskParams): Promise<CreatedTask> {
     const body: JSONObject = { model: params.model, input: params.input };
     // An empty string means "no route" — omit it, matching the other SDKs and
     // the server's "'' ≡ absent ≡ default" rule. Keeping the field out also
@@ -89,18 +97,16 @@ export class Tasks {
     if (params.route) {
       body.route = params.route;
     }
+    if (params.storage) {
+      body.storage = params.storage;
+    }
     if (params.callback !== undefined) {
       body.callback = params.callback;
     }
-    // A whitespace-only key (e.g. " ") is truthy in JS but gets normalized
-    // away to an empty header value on the wire (HTTP strips leading/trailing
-    // whitespace from header values), which a server treats as "no key" —
-    // trim before deciding this POST is idempotency-safe, or a network error
-    // could be retried under the false belief that duplicates collapse
-    // server-side, creating (and billing) a second task.
-    const idempotencyKey = params.idempotencyKey?.trim();
-    const extraHeaders = idempotencyKey
-      ? { [IDEMPOTENCY_KEY_HEADER]: idempotencyKey }
+    // Whitespace-only key handling lives in Transport (the single funnel
+    // every request goes through), not here — see its comment.
+    const extraHeaders = params.idempotencyKey
+      ? { [IDEMPOTENCY_KEY_HEADER]: params.idempotencyKey }
       : undefined;
     const [env, respHeaders] = await this.transport.requestWithHeaders("POST", "/tasks", {
       body,
@@ -135,11 +141,13 @@ export class Tasks {
    *
    * Resolves with the {@link Task} on `success`. Throws
    * {@link TaskFailedError} on `fail` and {@link PollTimeoutError} once
-   * `timeoutMs` milliseconds have elapsed *between polls* — the deadline is
-   * only checked before each `retrieve` call, so a slow individual request
-   * (network retries, a large `Retry-After`) can push the actual wall-clock
-   * time somewhat past `timeoutMs` before it's caught. It is a budget for the
-   * polling loop, not a hard per-call cutoff.
+   * `timeoutMs` milliseconds have elapsed *between polls*: the deadline is
+   * re-checked once per iteration, right after each `retrieve` call resolves
+   * and before starting the next one — so it can't cut off a call already in
+   * flight, and a slow individual request (network retries, a large
+   * `Retry-After`) can push the actual wall-clock time somewhat past
+   * `timeoutMs` before that's caught. It is a budget for the polling loop,
+   * not a hard per-call cutoff.
    */
   async wait(taskId: string, options: WaitOptions = {}): Promise<Task> {
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -147,8 +155,13 @@ export class Tasks {
     // Inverted comparisons (rather than `<= 0` / `< 0`) so a NaN value fails
     // the check too — a bare `NaN <= 0` is `false`, which would otherwise let
     // NaN slip through and turn the loop below into a zero-delay busy poll.
-    if (!(pollIntervalMs > 0)) {
-      throw new RangeError("pollIntervalMs must be > 0");
+    // pollIntervalMs must additionally be finite (unlike timeoutMs, which may
+    // be Infinity to mean "no timeout"): confirmed via `node -e` that
+    // `setTimeout(fn, Infinity)` does NOT wait forever — Node clamps it to
+    // 1ms (with a TimeoutOverflowWarning), which would turn an "infinite
+    // interval" into the same zero-delay busy-poll NaN causes.
+    if (!Number.isFinite(pollIntervalMs) || !(pollIntervalMs > 0)) {
+      throw new RangeError("pollIntervalMs must be a finite number > 0");
     }
     if (!(timeoutMs >= 0)) {
       throw new RangeError("timeoutMs must be >= 0");
@@ -184,9 +197,7 @@ export class Tasks {
    * Equivalent to {@link create} followed by {@link wait}. `callback` is
    * optional and independent of polling; set it if you also want a webhook.
    */
-  async run<TInput extends object = Record<string, unknown>>(
-    params: RunParams<TInput>,
-  ): Promise<Task> {
+  async run(params: RunParams): Promise<Task> {
     const created = await this.create(params);
     return this.wait(created.taskId, {
       pollIntervalMs: params.pollIntervalMs,

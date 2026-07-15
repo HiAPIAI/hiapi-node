@@ -49,14 +49,15 @@ describe("Task.fromJSON", () => {
     assert.deepEqual([...TERMINAL_STATUSES].sort(), ["fail", "success"]);
   });
 
-  test("TERMINAL_STATUSES is actually frozen (not just typed readonly) and isolated from isTerminal", () => {
-    assert.ok(Object.isFrozen(TERMINAL_STATUSES));
-    assert.throws(() => (TERMINAL_STATUSES as unknown as string[]).push("handling"));
-    // Even if a caller somehow mutated the exported reference, isTerminal
-    // must not be corruptible through it — it checks an internal set that is
-    // never exposed.
+  test("mutating the exported TERMINAL_STATUSES cannot corrupt Task.isTerminal", () => {
+    // `Object.freeze()` does not actually block `.add()`/`.delete()` on a Set
+    // (verified: freezing a Set has no effect on its mutating methods), so
+    // isTerminal deliberately checks a separate, unexported instance instead
+    // of relying on the exported reference staying untouched.
+    (TERMINAL_STATUSES as unknown as Set<string>).add("handling");
     const task = Task.fromJSON({ taskId: "t", model: "m", status: "handling" });
     assert.equal(task.isTerminal, false);
+    (TERMINAL_STATUSES as unknown as Set<string>).delete("handling");
   });
 
   test("parses the error object and filters malformed output entries", () => {

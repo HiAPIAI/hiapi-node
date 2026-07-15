@@ -52,7 +52,7 @@
     "build:cjs": "tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type: 'commonjs'}) + '\\n')\"",
     "pretest": "tsc -p tsconfig.test.json",
     "test": "node --test build-test/tests/*.test.js && npm run smoke",
-    "smoke": "npm run build && node scripts/smoke-esm.mjs && node scripts/smoke-cjs.cjs",
+    "smoke": "npm run build && node scripts/smoke-esm.mjs && node scripts/smoke-cjs.cjs && node scripts/smoke-types.mjs",
     "prepack": "npm run build"
   },
   "devDependencies": {

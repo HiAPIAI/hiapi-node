@@ -52,15 +52,21 @@ describe("client construction", () => {
     }
   });
 
-  test("rejects a non-finite timeoutMs or maxRetries at construction, not on first request", () => {
-    for (const timeoutMs of [NaN, Infinity, -1, 0]) {
+  test("rejects an invalid timeoutMs or maxRetries at construction, not on first request", () => {
+    // 0.5 and 4294967296 (2^32) are real, verified failures of Node's own
+    // AbortSignal.timeout(): the first because it requires an integer, the
+    // second because it exceeds the 32-bit unsigned max Node's timers accept
+    // — both throw a confusing RangeError deep inside the request loop if
+    // timeoutMs isn't validated up front at construction time instead.
+    for (const timeoutMs of [NaN, Infinity, -1, 0, 0.5, 4_294_967_296]) {
       assert.throws(() => new HiAPI({ apiKey: "sk-test", timeoutMs }), RangeError, `timeoutMs=${timeoutMs}`);
     }
     for (const maxRetries of [NaN, Infinity]) {
       assert.throws(() => new HiAPI({ apiKey: "sk-test", maxRetries }), RangeError, `maxRetries=${maxRetries}`);
     }
-    // Sanity: valid values still construct fine.
+    // Sanity: valid values, including the exact upper bound, still construct fine.
     assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", timeoutMs: 1000, maxRetries: 0 }));
+    assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", timeoutMs: 4_294_967_295 }));
   });
 
   test("a custom fetch implementation is used for requests", async () => {

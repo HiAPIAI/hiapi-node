@@ -52,6 +52,16 @@ describe("tasks.create", () => {
     });
   });
 
+  test("storage is forwarded when set, omitted otherwise", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "t" } }));
+    await client().tasks.create({ model: "m", input: {}, storage: "persistent" });
+    assert.equal(JSON.parse(mock.requests[0].body).storage, "persistent");
+
+    mock.reset(() => jsonReply({ data: { taskId: "t" } }));
+    await client().tasks.create({ model: "m", input: {} });
+    assert.equal(Object.hasOwn(JSON.parse(mock.requests[0].body), "storage"), false);
+  });
+
   test("idempotencyKey is sent as the Idempotency-Key header", async () => {
     mock.reset(() => jsonReply({ data: { taskId: "t" } }));
     await client().tasks.create({ model: "m", input: {}, idempotencyKey: "abc-123" });
@@ -223,8 +233,20 @@ describe("tasks.wait", () => {
 
   test("rejects invalid intervals up front", async () => {
     await assert.rejects(client().tasks.wait("w1", { pollIntervalMs: 0 }), RangeError);
+    await assert.rejects(client().tasks.wait("w1", { pollIntervalMs: NaN }), RangeError);
+    // Infinity is a real, verified failure mode, not just a theoretical one:
+    // `setTimeout(fn, Infinity)` does not wait forever — Node clamps it to
+    // 1ms — so an infinite interval would degrade into a busy-poll rather
+    // than the "poll once and then never again" a caller might expect.
+    await assert.rejects(client().tasks.wait("w1", { pollIntervalMs: Infinity }), RangeError);
     await assert.rejects(client().tasks.wait("w1", { timeoutMs: -1 }), RangeError);
     assert.equal(mock.requests.length, 0);
+  });
+
+  test("timeoutMs: Infinity is allowed (no timeout) as long as pollIntervalMs stays finite", async () => {
+    mock.reset(() => statusReply("success"));
+    const task = await client().tasks.wait("w1", { pollIntervalMs: 1, timeoutMs: Infinity });
+    assert.equal(task.status, "success");
   });
 
   test("an AbortSignal stops the poll loop promptly", async () => {

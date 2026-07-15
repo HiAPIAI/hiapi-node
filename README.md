@@ -42,16 +42,20 @@ for (const out of task.output) {
 ```
 
 `run()` resolves once the task reaches a terminal state. It throws
-`TaskFailedError` if the task fails and `PollTimeoutError` if it doesn't finish
-within `timeoutMs` (default 600000 — 10 minutes). A poll timeout does **not**
-cancel the task — it may still finish (and bill) later; take `taskId` from the
+`TaskFailedError` if the task fails and `PollTimeoutError` once the
+`timeoutMs` polling budget (default 600000 — 10 minutes) is used up — checked
+between polls, not a hard cutoff, so a slow individual request can push the
+actual wait somewhat past `timeoutMs`. A poll timeout does **not** cancel the
+task — it may still finish (and bill) later; take `taskId` from the
 `PollTimeoutError` and `retrieve()` it instead of submitting the same request
 again.
 
 Output URLs are **temporary** — they expire about 7 days after creation (each
-output carries `expireAt`). To keep an output long-term, promote it to
-persistent storage before it expires — see the
-[Output Storage docs](https://docs.hiapi.ai/storage/).
+output carries `expireAt`). To keep an output long-term, pass
+`storage: "persistent"` to `create()`/`run()` (billed by size; insufficient
+balance or exceeding your storage cap silently downgrades to `"temp"` — the
+actual tier used is echoed back as `task.storage`), or promote it after the
+fact — see the [Output Storage docs](https://docs.hiapi.ai/storage/).
 
 ## Lower-level control
 

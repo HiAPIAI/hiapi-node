@@ -105,6 +105,31 @@ describe("verifyWebhook", () => {
     }
   });
 
+  test("rejects a non-finite now override the same way as tolerance (same fail-open class)", () => {
+    const ts = String(nowSecs());
+    assert.throws(
+      () => verifyWebhook(PAYLOAD, { signature: sign(PAYLOAD, ts), timestamp: ts, secret: SECRET, now: NaN }),
+      /now must be a finite number/,
+    );
+  });
+
+  test("rejects a signature-verified body that isn't valid UTF-8 instead of silently repairing it", () => {
+    // Invalid bytes placed inside a JSON string value so the structure stays
+    // parseable — proving the body would otherwise silently decode with
+    // U+FFFD replacement characters (verified via `node -e`) rather than
+    // being rejected, unlike Python's strict-by-default `.decode("utf-8")`.
+    const prefix = Buffer.from('{"taskId":"cb-');
+    const invalid = Buffer.from([0xff, 0xfe]);
+    const suffix = Buffer.from('1","model":"m","status":"success"}');
+    const bodyBytes = Buffer.concat([prefix, invalid, suffix]);
+    const ts = String(nowSecs());
+    const signature = createHmac("sha256", SECRET).update(`${ts}.`).update(bodyBytes).digest("hex");
+    assert.throws(
+      () => verifyWebhook(bodyBytes, { signature, timestamp: ts, secret: SECRET }),
+      /not valid JSON/,
+    );
+  });
+
   test("the now override pins the clock for testing", () => {
     const ts = "1700000000";
     const task = verifyWebhook(PAYLOAD, {
