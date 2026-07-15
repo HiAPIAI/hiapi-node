@@ -10,8 +10,16 @@ export type JSONObject = Record<string, unknown>;
 
 export type TaskStatus = "queued" | "handling" | "archiving" | "success" | "fail";
 
+// Used internally for the `.has()` check in `Task.isTerminal`. Kept separate
+// from the exported `TERMINAL_STATUSES` below: `ReadonlySet` only blocks
+// mutation at the type level — `Object.freeze()` does NOT actually prevent
+// `.add()`/`.delete()` on a `Set` at runtime, so a caller with access to the
+// exported value (or bypassing the type via `as`) could otherwise corrupt
+// this module-level singleton and silently break every `Task` in the process.
+const TERMINAL_STATUS_SET: ReadonlySet<string> = new Set(["success", "fail"]);
+
 /** Terminal statuses a task can never leave once reached. */
-export const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["success", "fail"]);
+export const TERMINAL_STATUSES: readonly string[] = Object.freeze(["success", "fail"]);
 
 function str(v: unknown, fallback = ""): string {
   return typeof v === "string" ? v : fallback;
@@ -121,7 +129,7 @@ export class Task {
   }
 
   get isTerminal(): boolean {
-    return TERMINAL_STATUSES.has(this.status);
+    return TERMINAL_STATUS_SET.has(this.status);
   }
 
   get succeeded(): boolean {

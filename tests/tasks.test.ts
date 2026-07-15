@@ -58,6 +58,29 @@ describe("tasks.create", () => {
     assert.equal(mock.requests[0].headers["idempotency-key"], "abc-123");
   });
 
+  test("a whitespace-only idempotencyKey is treated as absent, not sent as a header", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "t" } }));
+    await client().tasks.create({ model: "m", input: {}, idempotencyKey: "   " });
+    assert.equal(mock.requests[0].headers["idempotency-key"], undefined);
+  });
+
+  // Compile-time regression check for a real tsc error (models.ts JSONObject):
+  // a plain named interface, with no `[key: string]: unknown` index signature,
+  // must be assignable to `input` without a cast — `pretest` type-checks this
+  // file, so reverting the generic on CreateTaskParams breaks the build here.
+  interface SeedanceInput {
+    prompt: string;
+    resolution: string;
+  }
+
+  test("a named interface (no index signature) is accepted as input without a cast", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "t" } }));
+    const input: SeedanceInput = { prompt: "a cyan glass data center", resolution: "1080p" };
+    const created = await client().tasks.create({ model: "seedance-2-0", input });
+    assert.equal(created.taskId, "t");
+    assert.deepEqual(JSON.parse(mock.requests[0].body).input, input);
+  });
+
   test("Idempotent-Replay response header sets idempotentReplay", async () => {
     mock.reset(() => jsonReply({ data: { taskId: "t" } }, 200, { "Idempotent-Replay": "true" }));
     const created = await client().tasks.create({ model: "m", input: {}, idempotencyKey: "k" });

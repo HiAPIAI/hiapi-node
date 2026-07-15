@@ -56,6 +56,17 @@ export class Transport {
     maxRetries: number,
     fetchImpl?: FetchLike,
   ) {
+    // Fail fast and clearly at construction time. Left unvalidated, a NaN or
+    // Infinity timeoutMs throws deep inside AbortSignal.timeout() on every
+    // attempt (surfacing as a misleading APIConnectionError after wasted
+    // retries), and an Infinity maxRetries turns a persistent 429/503/network
+    // failure into an infinite retry loop.
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError(`timeoutMs must be a finite number > 0, got ${timeoutMs}`);
+    }
+    if (!Number.isFinite(maxRetries)) {
+      throw new RangeError(`maxRetries must be a finite number, got ${maxRetries}`);
+    }
     this.apiKey = apiKey;
     this.baseUrl = normalizeBaseUrl(baseUrl);
     this.timeoutMs = timeoutMs;
@@ -132,7 +143,9 @@ export class Transport {
           attempt += 1;
           continue;
         }
-        throw new APIConnectionError(`request to ${url} failed: ${describeError(err)}`);
+        throw new APIConnectionError(`request to ${url} failed: ${describeError(err)}`, {
+          cause: err,
+        });
       }
 
       if (RETRY_STATUSES.has(status) && attempt < this.maxRetries) {

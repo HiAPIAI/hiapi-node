@@ -17,7 +17,14 @@ export interface HiAPIOptions {
   baseUrl?: string;
   /** Per-request timeout in milliseconds. Default 60000. */
   timeoutMs?: number;
-  /** Retries for 429/503 and network errors (exponential backoff). Default 2. */
+  /**
+   * Retries for 429/503 (always) and network errors (exponential backoff).
+   * Default 2. Network-error retries are conditional: a `GET`/`HEAD`/`PUT`/
+   * `DELETE`, or a `POST` carrying `idempotencyKey`, retries on a network
+   * failure — a keyless `POST` (e.g. plain `tasks.create()`) does not, since
+   * the request may have already reached the server and there is no safe way
+   * to tell without an idempotency key.
+   */
   maxRetries?: number;
   /**
    * Default signing key for `client.webhooks.verify`; falls back to the
@@ -49,7 +56,12 @@ export class HiAPI {
   readonly webhooks: Webhooks;
 
   constructor(options: HiAPIOptions = {}) {
-    const key = options.apiKey ?? process.env.HIAPI_API_KEY;
+    // `||`, not `??`: an explicit empty string should fall back to the
+    // environment variable too (matching the Python SDK), not be treated as
+    // "an API key was provided". Either way `if (!key)` below still rejects
+    // an empty result — this only changes whether a set HIAPI_API_KEY is
+    // tried first.
+    const key = options.apiKey || process.env.HIAPI_API_KEY;
     if (!key) {
       throw new HiAPIError(
         "missing API key: pass apiKey or set the HIAPI_API_KEY environment variable",
@@ -64,6 +76,6 @@ export class HiAPI {
       options.fetch,
     );
     this.tasks = new Tasks(transport);
-    this.webhooks = new Webhooks(options.webhookSecret ?? process.env.HIAPI_WEBHOOK_SECRET);
+    this.webhooks = new Webhooks(options.webhookSecret || process.env.HIAPI_WEBHOOK_SECRET);
   }
 }

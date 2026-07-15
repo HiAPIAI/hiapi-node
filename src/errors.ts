@@ -23,8 +23,8 @@ import type { Task } from "./models.js";
 
 /** Base class for every error thrown by the SDK. */
 export class HiAPIError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "HiAPIError";
   }
 }
@@ -148,8 +148,8 @@ export class IdempotencyKeyMismatchError extends APIError {
 
 /** A network-level failure (or client-side timeout) prevented the request from completing. */
 export class APIConnectionError extends HiAPIError {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "APIConnectionError";
   }
 }

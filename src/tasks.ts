@@ -8,14 +8,19 @@ import { IDEMPOTENCY_KEY_HEADER, sleep, Transport } from "./transport.js";
 export const DEFAULT_POLL_INTERVAL_MS = 3_000;
 export const DEFAULT_POLL_TIMEOUT_MS = 600_000;
 
-export interface CreateTaskParams {
+export interface CreateTaskParams<TInput extends object = Record<string, unknown>> {
   model: string;
   /**
    * The model's business parameters (fields vary per model). Do not put
    * callback/webhook fields inside `input` — pass `callback` separately or
    * the request is rejected.
+   *
+   * Typed as a generic `object` (not `Record<string, unknown>` directly) so a
+   * plain named `interface` — which TypeScript does not consider structurally
+   * assignable to an index-signature type without an explicit `[key: string]:
+   * unknown` — can be passed here without a cast.
    */
-  input: JSONObject;
+  input: TInput;
   /** Webhook target, e.g. `{ url: "https://...", when: "final" }`. */
   callback?: JSONObject;
   /**
@@ -40,9 +45,10 @@ export interface WaitOptions {
   /** Delay between polls. Default 3000 ms. */
   pollIntervalMs?: number;
   /**
-   * Client-side deadline for the poll loop. Default 600000 ms (10 minutes).
-   * Reaching it throws {@link PollTimeoutError} — the task itself is NOT
-   * cancelled and may still complete (and bill).
+   * Client-side budget for the poll loop, checked between polls (not a hard
+   * per-request cutoff — see {@link Tasks.wait}). Default 600000 ms (10
+   * minutes). Reaching it throws {@link PollTimeoutError} — the task itself
+   * is NOT cancelled and may still complete (and bill).
    */
   timeoutMs?: number;
   /** Called once per status change while waiting; receives the latest Task. */
@@ -56,7 +62,8 @@ export interface WaitOptions {
   signal?: AbortSignal;
 }
 
-export type RunParams = CreateTaskParams & WaitOptions;
+export type RunParams<TInput extends object = Record<string, unknown>> = CreateTaskParams<TInput> &
+  WaitOptions;
 
 export interface ListParams {
   page?: number;
@@ -71,7 +78,9 @@ export class Tasks {
   }
 
   /** Submit a task and return immediately with its `taskId`. */
-  async create(params: CreateTaskParams): Promise<CreatedTask> {
+  async create<TInput extends object = Record<string, unknown>>(
+    params: CreateTaskParams<TInput>,
+  ): Promise<CreatedTask> {
     const body: JSONObject = { model: params.model, input: params.input };
     // An empty string means "no route" — omit it, matching the other SDKs and
     // the server's "'' ≡ absent ≡ default" rule. Keeping the field out also
@@ -83,8 +92,15 @@ export class Tasks {
     if (params.callback !== undefined) {
       body.callback = params.callback;
     }
-    const extraHeaders = params.idempotencyKey
-      ? { [IDEMPOTENCY_KEY_HEADER]: params.idempotencyKey }
+    // A whitespace-only key (e.g. " ") is truthy in JS but gets normalized
+    // away to an empty header value on the wire (HTTP strips leading/trailing
+    // whitespace from header values), which a server treats as "no key" —
+    // trim before deciding this POST is idempotency-safe, or a network error
+    // could be retried under the false belief that duplicates collapse
+    // server-side, creating (and billing) a second task.
+    const idempotencyKey = params.idempotencyKey?.trim();
+    const extraHeaders = idempotencyKey
+      ? { [IDEMPOTENCY_KEY_HEADER]: idempotencyKey }
       : undefined;
     const [env, respHeaders] = await this.transport.requestWithHeaders("POST", "/tasks", {
       body,
@@ -118,16 +134,23 @@ export class Tasks {
    * Poll `taskId` until it reaches a terminal state.
    *
    * Resolves with the {@link Task} on `success`. Throws
-   * {@link TaskFailedError} on `fail` and {@link PollTimeoutError} only once
-   * `timeoutMs` milliseconds have actually elapsed.
+   * {@link TaskFailedError} on `fail` and {@link PollTimeoutError} once
+   * `timeoutMs` milliseconds have elapsed *between polls* — the deadline is
+   * only checked before each `retrieve` call, so a slow individual request
+   * (network retries, a large `Retry-After`) can push the actual wall-clock
+   * time somewhat past `timeoutMs` before it's caught. It is a budget for the
+   * polling loop, not a hard per-call cutoff.
    */
   async wait(taskId: string, options: WaitOptions = {}): Promise<Task> {
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const timeoutMs = options.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
-    if (pollIntervalMs <= 0) {
+    // Inverted comparisons (rather than `<= 0` / `< 0`) so a NaN value fails
+    // the check too — a bare `NaN <= 0` is `false`, which would otherwise let
+    // NaN slip through and turn the loop below into a zero-delay busy poll.
+    if (!(pollIntervalMs > 0)) {
       throw new RangeError("pollIntervalMs must be > 0");
     }
-    if (timeoutMs < 0) {
+    if (!(timeoutMs >= 0)) {
       throw new RangeError("timeoutMs must be >= 0");
     }
     const deadline = performance.now() + timeoutMs;
@@ -161,7 +184,9 @@ export class Tasks {
    * Equivalent to {@link create} followed by {@link wait}. `callback` is
    * optional and independent of polling; set it if you also want a webhook.
    */
-  async run(params: RunParams): Promise<Task> {
+  async run<TInput extends object = Record<string, unknown>>(
+    params: RunParams<TInput>,
+  ): Promise<Task> {
     const created = await this.create(params);
     return this.wait(created.taskId, {
       pollIntervalMs: params.pollIntervalMs,

@@ -142,6 +142,35 @@ describe("HTTP status retries (429/503)", () => {
     );
     assert.equal(mock.requests.length, 1);
   });
+
+  test("a keyless POST also retries on 429/503 (status-based retry is unconditional)", async () => {
+    mock.reset((_req, index) =>
+      index === 0
+        ? jsonReply({ message: "slow down" }, 429, { "Retry-After": "0" })
+        : jsonReply({ data: { taskId: "post-ok" } }),
+    );
+    const created = await client().tasks.create({ model: "m", input: {} });
+    assert.equal(created.taskId, "post-ok");
+    assert.equal(mock.requests.length, 2);
+  });
+
+  test("an HTTP-date Retry-After on a real 429 is honoured through the full retry loop", async () => {
+    // toUTCString() truncates to whole seconds, so a target under ~1s out can
+    // round down to "now" or even the past. 1800ms guarantees a real wait
+    // (>=~800ms after worst-case truncation) without slowing the suite much.
+    const future = new Date(Date.now() + 1_800).toUTCString();
+    mock.reset((_req, index) =>
+      index === 0
+        ? jsonReply({ message: "slow down" }, 429, { "Retry-After": future })
+        : jsonReply({ data: { taskId: "t-date" } }),
+    );
+    const started = performance.now();
+    const task = await client().tasks.retrieve("t-date");
+    assert.equal(task.taskId, "t-date");
+    assert.equal(mock.requests.length, 2);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed >= 700, `should have waited close to the Retry-After delay, got ${elapsed}ms`);
+  });
 });
 
 describe("retryDelayMs", () => {
@@ -221,6 +250,21 @@ describe("network-error retry gates", () => {
       APIConnectionError,
     );
     assert.equal(flaky.calls(), 3); // initial + 2 retries
+  });
+
+  test("APIConnectionError preserves the original error as .cause", async () => {
+    const original = new TypeError("fetch failed");
+    const impl: FetchLike = async () => {
+      throw original;
+    };
+    await assert.rejects(
+      client({ fetch: impl, maxRetries: 0 }).tasks.retrieve("t"),
+      (err: unknown) => {
+        assert.ok(err instanceof APIConnectionError);
+        assert.equal(err.cause, original);
+        return true;
+      },
+    );
   });
 });
 

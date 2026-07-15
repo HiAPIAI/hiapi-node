@@ -92,6 +92,19 @@ describe("verifyWebhook", () => {
     assert.equal(task.taskId, "cb-1");
   });
 
+  test("rejects a non-finite or negative tolerance instead of silently disabling the check", () => {
+    const ts = String(nowSecs());
+    // NaN is falsy in JS: `if (tolerance)` would otherwise skip the freshness
+    // check entirely (fail-open) rather than reject the bad config loudly.
+    for (const tolerance of [NaN, Infinity, -1]) {
+      assert.throws(
+        () => verifyWebhook(PAYLOAD, { signature: sign(PAYLOAD, ts), timestamp: ts, secret: SECRET, tolerance }),
+        /tolerance must be a finite number/,
+        `tolerance=${tolerance}`,
+      );
+    }
+  });
+
   test("the now override pins the clock for testing", () => {
     const ts = "1700000000";
     const task = verifyWebhook(PAYLOAD, {

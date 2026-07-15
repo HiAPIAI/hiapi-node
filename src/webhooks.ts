@@ -54,6 +54,13 @@ export function verifyWebhook(body: string | Uint8Array, opts: VerifyWebhookOpti
   if (!secret) {
     throw new WebhookVerificationError("no webhook signing secret configured");
   }
+  // A NaN tolerance is falsy in JS, so `if (tolerance)` below would silently
+  // SKIP the freshness check rather than disable it loudly — a caller's typo
+  // or bad config (e.g. Number(process.env.X) on an unset var) would fail
+  // open on the replay-protection window instead of failing closed.
+  if (!Number.isFinite(tolerance) || tolerance < 0) {
+    throw new WebhookVerificationError(`tolerance must be a finite number >= 0, got ${tolerance}`);
+  }
 
   if (!/^-?\d+$/.test(timestamp.trim())) {
     throw new WebhookVerificationError("invalid timestamp header");

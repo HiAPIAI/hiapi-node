@@ -37,6 +37,32 @@ describe("client construction", () => {
     }
   });
 
+  test("an explicit empty apiKey falls back to HIAPI_API_KEY, matching the Python SDK", () => {
+    const prev = process.env.HIAPI_API_KEY;
+    process.env.HIAPI_API_KEY = "sk-env-fallback";
+    try {
+      const client = new HiAPI({ apiKey: "" });
+      assert.equal(client.baseUrl, DEFAULT_BASE_URL);
+    } finally {
+      if (prev === undefined) {
+        delete process.env.HIAPI_API_KEY;
+      } else {
+        process.env.HIAPI_API_KEY = prev;
+      }
+    }
+  });
+
+  test("rejects a non-finite timeoutMs or maxRetries at construction, not on first request", () => {
+    for (const timeoutMs of [NaN, Infinity, -1, 0]) {
+      assert.throws(() => new HiAPI({ apiKey: "sk-test", timeoutMs }), RangeError, `timeoutMs=${timeoutMs}`);
+    }
+    for (const maxRetries of [NaN, Infinity]) {
+      assert.throws(() => new HiAPI({ apiKey: "sk-test", maxRetries }), RangeError, `maxRetries=${maxRetries}`);
+    }
+    // Sanity: valid values still construct fine.
+    assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", timeoutMs: 1000, maxRetries: 0 }));
+  });
+
   test("a custom fetch implementation is used for requests", async () => {
     const urls: string[] = [];
     const fake: FetchLike = async (input) => {
