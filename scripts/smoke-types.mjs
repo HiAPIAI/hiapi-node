@@ -58,10 +58,15 @@ async function run(): Promise<void> {
 void run();
 `;
 
+// `shell: true` on every call below: on Windows, locally-installed binaries
+// (npm, tsc) are `.cmd`/`.ps1` shims that `execFileSync` cannot run directly
+// without a shell (unlike POSIX, where the file itself is executable). Safe
+// here — every argument is a hardcoded constant, never untrusted input.
 const dir = mkdtempSync(join(tmpdir(), "hiapi-smoke-types-"));
 try {
   const tarballName = execFileSync("npm", ["pack", "--silent", `--pack-destination=${dir}`], {
     cwd: PACKAGE_ROOT,
+    shell: true,
   })
     .toString()
     .trim();
@@ -75,7 +80,10 @@ try {
     join(dir, "package.json"),
     JSON.stringify({ name: "smoke-consumer", private: true, type: "module" }),
   );
-  execFileSync("npm", ["install", "--no-audit", "--no-fund", "--silent", tarballPath], { cwd: dir });
+  execFileSync("npm", ["install", "--no-audit", "--no-fund", "--silent", tarballPath], {
+    cwd: dir,
+    shell: true,
+  });
 
   // (a) "import" + "types" condition, under an ESM-boundary package.json.
   writeFileSync(join(dir, "consumer-esm.ts"), CONSUMER_SOURCE);
@@ -93,7 +101,7 @@ try {
       "es2022",
       "consumer-esm.ts",
     ],
-    { cwd: dir, stdio: "pipe" },
+    { cwd: dir, stdio: "pipe", shell: true },
   );
 
   // (b) "require" + "types" condition — same source, CJS resolution mode.
@@ -112,7 +120,7 @@ try {
       "es2022",
       "consumer-cjs.cts",
     ],
-    { cwd: dir, stdio: "pipe" },
+    { cwd: dir, stdio: "pipe", shell: true },
   );
 
   console.log('smoke:types ok — both exports map "types" conditions resolve for a real npm install');

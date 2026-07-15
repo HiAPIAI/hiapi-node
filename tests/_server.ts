@@ -18,7 +18,10 @@ export interface MockReply {
 }
 
 /** Called per request; `index` is the 0-based request number since reset(). */
-export type MockHandler = (req: RecordedRequest, index: number) => MockReply;
+export type MockHandler = (
+  req: RecordedRequest,
+  index: number,
+) => MockReply | Promise<MockReply>;
 
 export function jsonReply(data: unknown, status = 200, headers: Record<string, string> = {}): MockReply {
   return {
@@ -46,9 +49,12 @@ export class MockServer {
           body: Buffer.concat(chunks).toString("utf8"),
         };
         this.requests.push(recorded);
-        const reply = this.handler(recorded, this.requests.length - 1);
-        res.writeHead(reply.status ?? 200, reply.headers ?? {});
-        res.end(reply.body ?? "");
+        // Allow a handler to delay its response (e.g. to test behavior while
+        // a request is genuinely in-flight) by returning a Promise.
+        Promise.resolve(this.handler(recorded, this.requests.length - 1)).then((reply) => {
+          res.writeHead(reply.status ?? 200, reply.headers ?? {});
+          res.end(reply.body ?? "");
+        });
       });
     });
     await new Promise<void>((resolve) => this.server!.listen(0, "127.0.0.1", resolve));

@@ -39,8 +39,9 @@ const MAX_RETRY_AFTER_MS = 60_000;
 // timer implementation uses a SIGNED 32-bit int, so a delay between
 // 2147483648 and 4294967295 passes validation but still gets silently
 // clamped to ~1ms (verified via `node -e`: AbortSignal.timeout(3_000_000_000)
-// fires within 50ms instead of ~50 minutes later). 2147483647 (2^31-1) is the
-// real, safe boundary — this was a genuine mistake in an earlier revision.
+// fires within 50ms instead of ~34.7 days later — 3e9ms ≈ 34.7 days, not the
+// ~50 minutes an earlier revision of this comment mistakenly claimed).
+// 2147483647 (2^31-1) is the real, safe boundary.
 // Exported so tasks.ts's pollIntervalMs validation (same underlying risk,
 // via plain setTimeout in sleep()) uses the identical, single-sourced value.
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;

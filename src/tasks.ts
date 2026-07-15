@@ -1,6 +1,6 @@
 /** The `client.tasks` resource — the unified async task API (/v1/tasks). */
 
-import { PollTimeoutError, TaskFailedError } from "./errors.js";
+import { HiAPIError, PollTimeoutError, TaskFailedError } from "./errors.js";
 import { CreatedTask, Task, TaskPage } from "./models.js";
 import type { JSONObject } from "./models.js";
 import { IDEMPOTENCY_KEY_HEADER, MAX_TIMER_DELAY_MS, sleep, Transport } from "./transport.js";
@@ -114,7 +114,19 @@ export class Tasks {
       extraHeaders,
     });
     const replay = (respHeaders.get("idempotent-replay") ?? "").toLowerCase() === "true";
-    return CreatedTask.fromJSON(data(env), replay);
+    const created = CreatedTask.fromJSON(data(env), replay);
+    // A 2xx response is only meaningful if it actually carries a task id —
+    // without this check, a malformed/anomalous `{data:{}}` response would
+    // silently produce a CreatedTask with taskId: "", and a subsequent
+    // run()/wait() would poll `GET /tasks/` (empty id) — surfacing as a
+    // confusing NotFoundError or PollTimeoutError instead of what actually
+    // went wrong: the server didn't return a task id.
+    if (!created.taskId) {
+      throw new HiAPIError(
+        "task creation succeeded but the response did not include a taskId",
+      );
+    }
+    return created;
   }
 
   /** Fetch a task's current status and (when `success`) its output. */
@@ -171,8 +183,17 @@ export class Tasks {
     ) {
       throw new RangeError(`pollIntervalMs must be a finite number in (0, ${MAX_TIMER_DELAY_MS}]`);
     }
-    if (!(timeoutMs >= 0)) {
-      throw new RangeError("timeoutMs must be >= 0");
+    // `typeof` first, not `Number.isFinite` (which would also reject the
+    // legitimate `Infinity` value): a bare `>= 0` comparison coerces a
+    // non-number — e.g. a plain-JS caller (no compile-time protection)
+    // passing the STRING "Infinity" — since `"Infinity" >= 0` reads as
+    // `Number("Infinity") >= 0` and passes, but `deadline + timeoutMs` below
+    // uses `+`, which for a string operand does concatenation instead of
+    // addition, producing a garbage value that later coerces to NaN and
+    // reproduces the exact zero-delay busy-poll this function guards against
+    // elsewhere. Confirmed by tracing the actual `+`/`-` coercion rules.
+    if (typeof timeoutMs !== "number" || Number.isNaN(timeoutMs) || timeoutMs < 0) {
+      throw new RangeError("timeoutMs must be a number >= 0");
     }
     const deadline = performance.now() + timeoutMs;
     let lastStatus: string | undefined;

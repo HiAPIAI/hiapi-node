@@ -245,7 +245,26 @@ describe("tasks.wait", () => {
     // than the "poll once and then never again" a caller might expect.
     await assert.rejects(client().tasks.wait("w1", { pollIntervalMs: Infinity }), RangeError);
     await assert.rejects(client().tasks.wait("w1", { timeoutMs: -1 }), RangeError);
+    // A non-number timeoutMs is a real bypass for a plain-JS caller (no
+    // compile-time protection): a bare `>= 0` comparison coerces "Infinity"
+    // via Number(), passing validation, but `deadline + timeoutMs` (a `+`,
+    // not `-`) then does STRING CONCATENATION for a string operand, which
+    // later reduces to NaN and reproduces the exact busy-poll this guards
+    // against elsewhere — confirmed by tracing the actual coercion.
+    // @ts-expect-error deliberately passing a non-number to test the runtime guard
+    await assert.rejects(client().tasks.wait("w1", { timeoutMs: "Infinity" }), RangeError);
     assert.equal(mock.requests.length, 0);
+  });
+
+  test("rejects a pollIntervalMs past Node's real (signed 32-bit) timer limit", async () => {
+    // MAX_TIMER_DELAY_MS + 1 must throw; the exact boundary must not.
+    await assert.rejects(
+      client().tasks.wait("w1", { pollIntervalMs: 2_147_483_648 }),
+      RangeError,
+    );
+    mock.reset(() => statusReply("success"));
+    const task = await client().tasks.wait("w1", { pollIntervalMs: 2_147_483_647 });
+    assert.equal(task.status, "success");
   });
 
   test("timeoutMs: Infinity is allowed (no timeout) as long as pollIntervalMs stays finite", async () => {
@@ -269,6 +288,37 @@ describe("tasks.wait", () => {
       return true;
     });
     assert.ok(performance.now() - started < 5_000);
+  });
+
+  test("an AbortSignal triggered while retrieve() is in flight is still honoured — no onUpdate, no terminal result", async () => {
+    // Regression test for the round-4 fix: the abort is re-checked right
+    // after `retrieve()` resolves, not just at the top of the loop — so even
+    // when the in-flight request's response is a terminal "success" (which
+    // would otherwise resolve wait()), the abort must win instead.
+    const controller = new AbortController();
+    let onUpdateCalls = 0;
+    mock.reset(
+      () =>
+        new Promise((resolve) => {
+          // Held open long enough for the abort (fired at 20ms) to land
+          // while this request is still in flight.
+          setTimeout(() => resolve(statusReply("success")), 100);
+        }),
+    );
+    const waiting = client().tasks.wait("w1", {
+      pollIntervalMs: 60_000,
+      timeoutMs: 120_000,
+      signal: controller.signal,
+      onUpdate: () => {
+        onUpdateCalls++;
+      },
+    });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(waiting, (err: unknown) => {
+      assert.equal((err as Error).name, "AbortError");
+      return true;
+    });
+    assert.equal(onUpdateCalls, 0);
   });
 });
 

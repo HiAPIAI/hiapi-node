@@ -18,6 +18,14 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
       - run: npm ci
+      - name: Verify tag matches package.json version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg — refusing to publish a mismatched, immutable npm release"
+            exit 1
+          fi
       - run: npm test
       - run: npm publish --provenance --access public
         env:
