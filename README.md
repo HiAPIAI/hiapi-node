@@ -17,7 +17,10 @@ Zero-dependency Node.js client for the [HiAPI](https://hiapi.ai) **unified async
 npm install hiapi
 ```
 
-Requires Node.js 18.17+.
+Requires Node.js 18.17+. On Node 18–20, the first request prints a one-time
+`ExperimentalWarning: The Fetch API is an experimental feature` to stderr —
+this comes from Node's own global `fetch` (stable since Node 21), not from
+this package, and is harmless.
 
 ## Quick start
 

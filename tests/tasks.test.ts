@@ -166,6 +166,23 @@ describe("tasks.wait", () => {
     );
   });
 
+  test("terminal fail with no error object, or a blank message, falls back to a generic message", async () => {
+    mock.reset(() => statusReply("fail"));
+    await assert.rejects(client().tasks.wait("w1", { pollIntervalMs: 1 }), (err: unknown) => {
+      assert.ok(err instanceof TaskFailedError);
+      assert.equal(err.code, undefined);
+      assert.match(err.message, /w1 failed: task failed/);
+      return true;
+    });
+
+    mock.reset(() => statusReply("fail", { error: { code: "X", message: "" } }));
+    await assert.rejects(client().tasks.wait("w1", { pollIntervalMs: 1 }), (err: unknown) => {
+      assert.ok(err instanceof TaskFailedError);
+      assert.match(err.message, /w1 failed: task failed/);
+      return true;
+    });
+  });
+
   test("client-side timeout throws PollTimeoutError with the task id", async () => {
     mock.reset(() => statusReply("queued"));
     await assert.rejects(

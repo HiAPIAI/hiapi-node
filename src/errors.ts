@@ -165,7 +165,7 @@ export class TaskFailedError extends HiAPIError {
   readonly code?: string;
 
   constructor(task: Task) {
-    const message = task.error?.message ?? "task failed";
+    const message = task.error?.message || "task failed";
     super(`task ${task.taskId || "?"} failed: ${message}`);
     this.name = "TaskFailedError";
     this.task = task;

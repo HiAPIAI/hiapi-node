@@ -47,7 +47,12 @@ export interface WaitOptions {
   timeoutMs?: number;
   /** Called once per status change while waiting; receives the latest Task. */
   onUpdate?: (task: Task) => void;
-  /** Aborts the poll loop (not the task) when triggered. */
+  /**
+   * Aborts the poll loop (not the task) when triggered. Checked between polls
+   * and before each `retrieve` call — not forwarded into the in-flight HTTP
+   * request, so aborting while a poll's request is already underway lets that
+   * one request finish before the loop stops.
+   */
   signal?: AbortSignal;
 }
 
