@@ -780,28 +780,54 @@ describe("tasks.run", () => {
     assert.equal(mock.requests.length, 0);
   });
 
-  test("RunAbortedError carries taskId and cause (constructed directly — see note below on why run() can no longer reach this via a realistic race)", () => {
-    // run()'s own `if (params.signal?.aborted) throw new
-    // RunAbortedError(...)` check, right after `await this.create(params)`,
-    // used to be reachable via a race: an abort landing in the gap between
-    // create()'s underlying request settling and this check running. Now
-    // that create() is itself signal-aware (CreateTaskParams.signal), that
-    // gap has closed for any REALISTIC caller: create()'s own code has no
-    // further `await` between its network call resolving and returning, so
-    // there is no yield point for an external timer/event to land in — an
-    // abort either arrives before create() is called (caught by run()'s
-    // pre-check), during create()'s own network operation (now caught by
-    // create() itself, propagating unwrapped — see the test below), or, if
-    // it fires any later, run() has already moved past this check entirely.
-    // The check remains as a defensive backstop (e.g. against a future
-    // create() gaining its own internal `await` after the network call),
-    // so RunAbortedError itself is still tested directly here rather than
-    // deleted.
-    const cause = new Error("cancelled by caller");
-    const err = new RunAbortedError("r2", { cause });
-    assert.equal(err.taskId, "r2");
-    assert.equal(err.cause, cause);
-    assert.match(err.message, /r2/);
+  test("an abort scheduled as a microtask during requestWithHeaders' own continuation still throws RunAbortedError carrying the taskId", async () => {
+    // A round-13 revision reasoned that this race had closed entirely, since
+    // create() itself has no further `await` after its network call
+    // resolves — that reasoning missed that EVERY `await` (including the
+    // ones inside requestWithHeaders, a different async function one level
+    // down) is its own microtask boundary, and `fetch` is a documented,
+    // user-replaceable option: a custom implementation can return a
+    // Response whose `.headers` getter has a side effect. Instrumenting it
+    // to schedule the abort via `queueMicrotask` — reading `resp.headers` is
+    // literally the last expression requestWithHeaders' success path
+    // evaluates, right before its own promise resolves — enqueues that
+    // abort BEFORE requestWithHeaders' promise settles, which is in turn
+    // BEFORE create()'s `await` on it resolves, which is in turn BEFORE
+    // run()'s own `await this.create(params)` resolves: by strict microtask
+    // queue (FIFO) ordering, the abort callback runs first every time.
+    // Confirmed by reproducing exactly this: RunAbortedError, taskId and
+    // cause intact, and no GET ever issued (wait() is never reached).
+    mock.reset(() => jsonReply({ data: { taskId: "r2" } }));
+    const controller = new AbortController();
+    const reason = new Error("cancelled by caller");
+    const raceClient = new HiAPI({
+      apiKey: "sk-test",
+      baseUrl: mock.url,
+      timeoutMs: 5_000,
+      maxRetries: 0,
+      fetch: async (...args) => {
+        const resp = await fetch(...args);
+        const realHeaders = resp.headers;
+        Object.defineProperty(resp, "headers", {
+          get() {
+            queueMicrotask(() => controller.abort(reason));
+            return realHeaders;
+          },
+        });
+        return resp;
+      },
+    });
+    await assert.rejects(
+      raceClient.tasks.run({ model: "m", input: {}, signal: controller.signal }),
+      (err: unknown) => {
+        assert.ok(err instanceof RunAbortedError);
+        assert.equal(err.taskId, "r2");
+        assert.equal(err.cause, reason);
+        assert.match(err.message, /r2/);
+        return true;
+      },
+    );
+    assert.equal(mock.requests.length, 1);
   });
 
   test("an abort landing DURING create()'s own network operation propagates unwrapped, the same 'outcome unknown' shape create() failures already have", async () => {

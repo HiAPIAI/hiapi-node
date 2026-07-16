@@ -227,8 +227,15 @@ export class Transport {
         this.timeoutMs,
       );
       try {
-        let status: number;
-        let respHeaders: Headers;
+        // Set as soon as headers arrive (before the body is even read), NOT
+        // typed as definitely-assigned `let status: number` the way an
+        // earlier revision had it — that version couldn't reference `status`
+        // from inside the catch below without a "used before assigned"
+        // compile error, which is exactly why the fix below didn't exist
+        // yet: there was no type-safe way to recover the ALREADY-KNOWN
+        // status once the body read itself was what failed.
+        let knownStatus: number | undefined;
+        let knownHeaders: Headers | undefined;
         let rawText: string;
         try {
           const resp = await this.fetchImpl(url, {
@@ -241,8 +248,8 @@ export class Transport {
             const text = await resp.text();
             return [decodeJson(text, resp.status), resp.headers];
           }
-          status = resp.status;
-          respHeaders = resp.headers;
+          knownStatus = resp.status;
+          knownHeaders = resp.headers;
           rawText = await safeText(resp, attemptSignal);
         } catch (err) {
           // decodeJson signals malformed 2xx bodies with an APIError — that is a
@@ -263,6 +270,28 @@ export class Transport {
           if (causedByCaller()) {
             throw opts.signal!.reason ?? new DOMException("This operation was aborted", "AbortError");
           }
+          // A non-2xx status was already known — headers had arrived —
+          // before THIS failure (the body read itself timing out) happened.
+          // If that status is one this SDK retries UNCONDITIONALLY (429/503,
+          // regardless of method or idempotency — the server rejected the
+          // request before processing), honour that using the Retry-After
+          // header already captured, rather than falling into the
+          // network-error gate below: for a keyless POST, that gate is
+          // `false`, so a body-read timeout on an ALREADY-KNOWN, always-
+          // retryable 429/503 would otherwise surface as an unretried
+          // APIConnectionError, silently discarding a retry the known status
+          // alone already made safe — confirmed by reproducing a keyless
+          // POST's 429 going unretried at maxRetries=1 when its own body
+          // read timed out.
+          if (
+            knownStatus !== undefined &&
+            RETRY_STATUSES.has(knownStatus) &&
+            attempt < this.maxRetries
+          ) {
+            await sleep(retryDelayMs(attempt, knownHeaders ?? null), opts.signal);
+            attempt += 1;
+            continue;
+          }
           // Anything else fetch throws is network-level: DNS, refused/reset
           // connections, TLS failures, or the per-attempt timeout firing.
           // Only retry when the request is safe to repeat (see gate above).
@@ -275,6 +304,8 @@ export class Transport {
             cause: err,
           });
         }
+        const status = knownStatus;
+        const respHeaders = knownHeaders!;
 
         if (RETRY_STATUSES.has(status) && attempt < this.maxRetries) {
           await sleep(retryDelayMs(attempt, respHeaders), opts.signal);

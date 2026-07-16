@@ -379,16 +379,22 @@ export class Tasks {
    * `wait()`-bound config mistake (e.g. `pollIntervalMs: 0`) doesn't still
    * let the task get created before ever discovering it can't actually be
    * polled for. `signal` is checked once more right after `create()`
-   * resolves as a defensive backstop — `create()` has no further `await`
-   * between its network call resolving and returning, so in practice there
-   * is no gap left for an external abort to land in this specific window —
-   * but if one ever did, it throws {@link RunAbortedError} carrying
-   * `taskId` (the task exists, and, unlike the pre-`create()` case, may
-   * already bill). Once the task exists, every OTHER way `run()` can fail
-   * (a network/API error while polling, an `onUpdate` rejection) is wrapped
-   * in {@link RunFailedError} so the `taskId` is never lost — except
-   * `TaskFailedError` and `PollTimeoutError` **for this same task**, which
-   * already carry it and are re-thrown unchanged.
+   * resolves: even though `create()` itself has no further `await` after
+   * its network call resolves, EVERY `await` — including the ones inside
+   * the transport, a separate `async` function further down the call stack
+   * — is its own microtask boundary, and `fetch` is a documented,
+   * user-replaceable option (a custom implementation reading a Response's
+   * `.headers` and scheduling an abort as a side effect of that read — the
+   * literal last expression the transport's success path evaluates — lands
+   * it, by strict FIFO microtask-queue ordering, before this check ever
+   * runs). Confirmed reachable this way, not merely theoretical. That case
+   * throws {@link RunAbortedError} carrying `taskId` (the task exists, and,
+   * unlike the pre-`create()` case, may already bill). Once the task
+   * exists, every OTHER way `run()` can fail (a network/API error while
+   * polling, an `onUpdate` rejection) is wrapped in {@link RunFailedError}
+   * so the `taskId` is never lost — except `TaskFailedError` and
+   * `PollTimeoutError` **for this same task**, which already carry it and
+   * are re-thrown unchanged.
    */
   async run(params: RunParams): Promise<Task> {
     params.signal?.throwIfAborted();

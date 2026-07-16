@@ -163,6 +163,46 @@ describe("HTTP status retries (429/503)", () => {
     assert.equal(mock.requests.length, 2);
   });
 
+  test("a keyless POST's known 429 still retries even when its own body read times out", async () => {
+    // Headers (status 429, Retry-After) arrive and are captured — then the
+    // BODY read itself hangs until the per-attempt timeout fires. That
+    // timeout-caused failure must not be treated as an ordinary network
+    // error: for a keyless POST, retryOnNetworkError is false, so falling
+    // into that gate (an earlier revision did) meant an ALREADY-KNOWN,
+    // always-retryable 429 went unretried, surfacing as an unretried
+    // APIConnectionError instead of the correct retry-then-succeed.
+    mock.reset(() => jsonReply({ data: { taskId: "post-ok" } }));
+    let callCount = 0;
+    const impl: FetchLike = async (input, init) => {
+      callCount += 1;
+      if (callCount === 1) {
+        const signal = init?.signal;
+        return {
+          ok: false,
+          status: 429,
+          headers: new Headers({ "Retry-After": "0" }),
+          text: () =>
+            new Promise<string>((_, reject) => {
+              const onAbort = () =>
+                reject(signal!.reason ?? new DOMException("timed out", "TimeoutError"));
+              if (signal?.aborted) {
+                onAbort();
+                return;
+              }
+              signal?.addEventListener("abort", onAbort, { once: true });
+            }),
+        } as unknown as Response;
+      }
+      return fetch(input, init);
+    };
+    const created = await client({ fetch: impl, timeoutMs: 30, maxRetries: 1 }).tasks.create({
+      model: "m",
+      input: {},
+    });
+    assert.equal(created.taskId, "post-ok");
+    assert.equal(callCount, 2);
+  });
+
   test("an HTTP-date Retry-After on a real 429 is honoured through the full retry loop", async () => {
     // toUTCString() truncates to whole seconds, so a target under ~1s out can
     // round down to "now" or even the past. 1800ms guarantees a real wait
