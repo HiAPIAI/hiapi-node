@@ -32,6 +32,19 @@ export class HiAPIError extends Error {
 }
 
 /**
+ * `cause`: set when this error was constructed FROM another one (e.g. the
+ * response body itself failed to read) rather than parsed from a real
+ * response body — absent for the normal "parsed the body, no/unrecognized
+ * error_code" case.
+ */
+export interface APIErrorOptions {
+  status: number;
+  errorCode?: string;
+  body?: string;
+  cause?: unknown;
+}
+
+/**
  * The server returned a non-2xx response.
  *
  * `status` is the HTTP status code, `errorCode` the business error code from
@@ -42,11 +55,8 @@ export class APIError extends HiAPIError {
   readonly errorCode?: string;
   readonly body?: string;
 
-  constructor(
-    message: string,
-    opts: { status: number; errorCode?: string; body?: string },
-  ) {
-    super(message);
+  constructor(message: string, opts: APIErrorOptions) {
+    super(message, opts.cause !== undefined ? { cause: opts.cause } : undefined);
     this.name = "APIError";
     this.status = opts.status;
     this.errorCode = opts.errorCode;
@@ -56,7 +66,7 @@ export class APIError extends HiAPIError {
 
 /** 401 — the API key is missing or invalid. */
 export class AuthenticationError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "AuthenticationError";
   }
@@ -64,7 +74,7 @@ export class AuthenticationError extends APIError {
 
 /** 404 — the task does not exist or does not belong to this account. */
 export class NotFoundError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "NotFoundError";
   }
@@ -72,7 +82,7 @@ export class NotFoundError extends APIError {
 
 /** 503 — the platform is temporarily unavailable; retry with backoff. */
 export class ServiceUnavailableError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "ServiceUnavailableError";
   }
@@ -80,7 +90,7 @@ export class ServiceUnavailableError extends APIError {
 
 /** error_code=INVALID_REQUEST — fix the request; do not retry as-is. */
 export class InvalidRequestError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "InvalidRequestError";
   }
@@ -88,7 +98,7 @@ export class InvalidRequestError extends APIError {
 
 /** error_code=MODEL_UNAVAILABLE — retry shortly or switch models. */
 export class ModelUnavailableError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "ModelUnavailableError";
   }
@@ -100,7 +110,7 @@ export class ModelUnavailableError extends APIError {
  * that was accepted later reaches the terminal `fail` status while polling.
  */
 export class TaskFailedSyncError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "TaskFailedSyncError";
   }
@@ -108,7 +118,7 @@ export class TaskFailedSyncError extends APIError {
 
 /** error_code=TASK_TIMEOUT — the upstream task timed out; retryable. */
 export class TaskTimeoutError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "TaskTimeoutError";
   }
@@ -116,7 +126,7 @@ export class TaskTimeoutError extends APIError {
 
 /** error_code=STORAGE_UNAVAILABLE — output storage error; retryable. */
 export class StorageUnavailableError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "StorageUnavailableError";
   }
@@ -130,7 +140,7 @@ export class StorageUnavailableError extends APIError {
  * before letting it surface.
  */
 export class IdempotencyKeyProcessingError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "IdempotencyKeyProcessingError";
   }
@@ -142,7 +152,7 @@ export class IdempotencyKeyProcessingError extends APIError {
  * construction is buggy (two distinct requests derived the same key).
  */
 export class IdempotencyKeyMismatchError extends APIError {
-  constructor(message: string, opts: { status: number; errorCode?: string; body?: string }) {
+  constructor(message: string, opts: APIErrorOptions) {
     super(message, opts);
     this.name = "IdempotencyKeyMismatchError";
   }
@@ -287,10 +297,7 @@ export class WebhookVerificationError extends HiAPIError {
   }
 }
 
-type APIErrorClass = new (
-  message: string,
-  opts: { status: number; errorCode?: string; body?: string },
-) => APIError;
+type APIErrorClass = new (message: string, opts: APIErrorOptions) => APIError;
 
 /** Maps the API `error_code` enum onto the matching error class. */
 export const ERROR_CODE_TO_CLASS: Record<string, APIErrorClass> = {

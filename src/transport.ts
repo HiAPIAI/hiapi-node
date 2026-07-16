@@ -11,6 +11,8 @@ import {
   APIError,
   ERROR_CODE_TO_CLASS,
   HiAPIError,
+  IdempotencyKeyMismatchError,
+  IdempotencyKeyProcessingError,
   STATUS_TO_CLASS,
 } from "./errors.js";
 import type { JSONObject } from "./models.js";
@@ -284,15 +286,20 @@ export class Transport {
           //   429 going unretried at maxRetries=1 when its own body read
           //   timed out).
           // - A 409 with an idempotency key is safe to retry even without
-          //   confirming it was specifically IDEMPOTENCY_KEY_PROCESSING
-          //   (as opposed to IDEMPOTENCY_KEY_MISMATCH) — a keyed request
-          //   never creates a second task on retry either way, and refusing
-          //   to retry just because the body happened to be unreadable
-          //   surfaced a misleadingly generic error instead of a real
-          //   chance at the safe replay path (confirmed by reproducing a
-          //   409 whose body read failed for a non-abort reason skipping
-          //   this retry entirely, unlike the otherwise-identical case
-          //   where the body read had succeeded).
+          //   confirming the body's error_code was specifically
+          //   IDEMPOTENCY_KEY_PROCESSING: per this API's own contract, that
+          //   is the ONLY documented error_code 409 is ever used for —
+          //   IDEMPOTENCY_KEY_MISMATCH is served on a completely different
+          //   status (422, not 409; see ERROR_CODE_TO_CLASS/STATUS_TO_CLASS
+          //   in errors.ts), so there's no plausible non-retryable meaning
+          //   for a 409 this SDK doesn't already know how to read a body for.
+          //   A keyed request never creates a second task on retry either
+          //   way, and refusing to retry just because the body happened to
+          //   be unreadable surfaced a misleadingly generic error instead
+          //   of a real chance at the safe replay path (confirmed by
+          //   reproducing a 409 whose body read failed for a non-abort
+          //   reason skipping this retry entirely, unlike the otherwise-
+          //   identical case where the body read had succeeded).
           if (knownStatus !== undefined) {
             const retryableKnownStatus =
               RETRY_STATUSES.has(knownStatus) || (hasIdempotencyKey && knownStatus === 409);
@@ -301,11 +308,20 @@ export class Transport {
               attempt += 1;
               continue;
             }
-            // Not retryable, or retries exhausted — still a definite,
-            // status-aware error (e.g. ServiceUnavailableError), not the
-            // ambiguous APIConnectionError below: there's simply no body to
-            // include, since that's what failed to read.
-            throw errorFromResponse(knownStatus, "");
+            // Not retryable, or retries exhausted — still a status-aware
+            // error, not the ambiguous APIConnectionError below: there's
+            // simply no body to include, since that's what failed to read.
+            // NOT routed through errorFromResponse()'s error_code-then-
+            // STATUS_TO_CLASS guessing, though — with no error_code to read
+            // (the body itself is what's missing), that fallback would
+            // often guess WRONG: a single status can carry several distinct
+            // business meanings (400 is both INVALID_REQUEST and
+            // MODEL_UNAVAILABLE; TASK_TIMEOUT/STORAGE_UNAVAILABLE aren't
+            // documented to one fixed status either) — confirmed by
+            // reproducing an unreadable 400 body that was actually
+            // MODEL_UNAVAILABLE surfacing as InvalidRequestError instead.
+            // The exact original read failure is preserved as `.cause`.
+            throw errorForUnreadableBody(knownStatus, hasIdempotencyKey, err);
           }
           // Anything else fetch throws is network-level: DNS, refused/reset
           // connections, TLS failures, or the per-attempt timeout firing —
@@ -572,4 +588,42 @@ function errorFromResponse(status: number, rawText: string): APIError {
     errorCode,
     body: rawText || undefined,
   });
+}
+
+/**
+ * Builds the error for a KNOWN status whose body could not be read at all —
+ * deliberately NOT via `errorFromResponse()`'s error_code-then-
+ * `STATUS_TO_CLASS` guessing, which exists for "the body parsed fine but had
+ * no/unrecognized error_code," a different situation from "there's no body
+ * to even attempt reading." Guessing a specific subclass from status alone
+ * here is often wrong, since one status can carry several distinct business
+ * meanings (see the call site's comment) — a plain `APIError` is the honest
+ * answer in general. The one exception is `POST /tasks` with an
+ * `idempotencyKey`: per this API's own contract, 409 there is used for
+ * EXACTLY `IDEMPOTENCY_KEY_PROCESSING` and 422 for EXACTLY
+ * `IDEMPOTENCY_KEY_MISMATCH` (see `ERROR_CODE_TO_CLASS`/`STATUS_TO_CLASS`
+ * above) — nothing else is documented to use either status on that
+ * endpoint, so those two keep their specific, actionable classes even
+ * without the body confirming it. The original read failure is always
+ * preserved as `cause`.
+ */
+function errorForUnreadableBody(
+  status: number,
+  hasIdempotencyKey: boolean,
+  cause: unknown,
+): APIError {
+  if (hasIdempotencyKey && status === 409) {
+    return new IdempotencyKeyProcessingError(`HTTP 409 (response body could not be read)`, {
+      status,
+      errorCode: IDEMPOTENCY_PROCESSING_CODE,
+      cause,
+    });
+  }
+  if (hasIdempotencyKey && status === 422) {
+    return new IdempotencyKeyMismatchError(`HTTP 422 (response body could not be read)`, {
+      status,
+      cause,
+    });
+  }
+  return new APIError(`HTTP ${status} (response body could not be read)`, { status, cause });
 }

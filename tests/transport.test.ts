@@ -687,6 +687,85 @@ describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {
     // Retry-After should have produced.
     assert.ok(elapsed >= 800, `should have waited close to the Retry-After delay, got ${elapsed}ms`);
   });
+
+  test("an exhausted, unreadable 409 still surfaces IdempotencyKeyProcessingError (not a generic APIError), with the read failure as cause", async () => {
+    // errorFromResponse()'s error_code-then-STATUS_TO_CLASS guessing has no
+    // error_code to read here (the body itself is what's missing) — routing
+    // an unreadable, exhausted-retries 409 through it anyway downgraded a
+    // definite, contractually-unambiguous (this endpoint's 409 is ALWAYS
+    // IDEMPOTENCY_KEY_PROCESSING) error into an uninformative plain
+    // APIError, discarding both the specific class and the original read
+    // failure a caller might want for diagnostics.
+    const readFailure = new Error("stream reset");
+    const impl: FetchLike = async () => ({
+      ok: false,
+      status: 409,
+      headers: new Headers({ "Retry-After": "0" }),
+      text: () => Promise.reject(readFailure),
+    } as unknown as Response);
+    await assert.rejects(
+      client({ fetch: impl, maxRetries: 0 }).tasks.create({
+        model: "m",
+        input: {},
+        idempotencyKey: "key-unreadable-409-exhausted",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof IdempotencyKeyProcessingError);
+        assert.equal(err.status, 409);
+        assert.equal(err.cause, readFailure);
+        return true;
+      },
+    );
+  });
+
+  test("an unreadable 422 with a key surfaces IdempotencyKeyMismatchError, with the read failure as cause", async () => {
+    const readFailure = new Error("stream reset");
+    const impl: FetchLike = async () => ({
+      ok: false,
+      status: 422,
+      headers: new Headers(),
+      text: () => Promise.reject(readFailure),
+    } as unknown as Response);
+    await assert.rejects(
+      client({ fetch: impl, maxRetries: 0 }).tasks.create({
+        model: "m",
+        input: {},
+        idempotencyKey: "key-unreadable-422",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof IdempotencyKeyMismatchError);
+        assert.equal(err.status, 422);
+        assert.equal(err.cause, readFailure);
+        return true;
+      },
+    );
+  });
+
+  test("an unreadable, ambiguous status (e.g. 400) never guesses a specific subclass — plain APIError, cause preserved", async () => {
+    // A single status can carry SEVERAL distinct business meanings (400 is
+    // both INVALID_REQUEST and MODEL_UNAVAILABLE) — with no error_code to
+    // read (the body is what's missing), guessing via STATUS_TO_CLASS would
+    // often be WRONG. Confirmed by reproducing an unreadable 400 that was
+    // actually MODEL_UNAVAILABLE surfacing as InvalidRequestError instead —
+    // the honest answer when the body can't be read is a plain APIError.
+    const readFailure = new Error("stream reset");
+    const impl: FetchLike = async () => ({
+      ok: false,
+      status: 400,
+      headers: new Headers(),
+      text: () => Promise.reject(readFailure),
+    } as unknown as Response);
+    await assert.rejects(
+      client({ fetch: impl, maxRetries: 0 }).tasks.retrieve("t"),
+      (err: unknown) => {
+        // Precisely APIError, not any subclass (InvalidRequestError included).
+        assert.equal(Object.getPrototypeOf(err), APIError.prototype);
+        assert.equal((err as APIError).status, 400);
+        assert.equal((err as APIError).cause, readFailure);
+        return true;
+      },
+    );
+  });
 });
 
 describe("error mapping", () => {
