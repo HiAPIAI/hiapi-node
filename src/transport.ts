@@ -361,8 +361,15 @@ export class Transport {
         // of retrying and succeeding on the next attempt). Only when
         // `errorCode` is genuinely absent, though — if the body DID parse
         // with some OTHER, explicit error_code, that's trusted as-is rather
-        // than overridden.
-        if (hasIdempotencyKey && err.errorCode === undefined) {
+        // than overridden. Checked via `.trim()`, not a bare `=== undefined`
+        // (an earlier revision of this exact fix used that, still missing
+        // this case) — a body that parses fine but has `error_code: ""` or
+        // a whitespace-only string is, per this SDK's own established
+        // "empty/blank means absent" convention elsewhere (taskId, status),
+        // just as unrecognizable as a missing field entirely: confirmed by
+        // reproducing a keyed 409 with `error_code: ""` still surfacing as
+        // an unretried, plain APIError.
+        if (hasIdempotencyKey && !err.errorCode?.trim()) {
           if (status === 409) {
             err = new IdempotencyKeyProcessingError(err.message, {
               status,

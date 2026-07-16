@@ -815,6 +815,61 @@ describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {
     );
   });
 
+  test("a keyed 409 with an empty or whitespace-only error_code still retries as IDEMPOTENCY_KEY_PROCESSING", async () => {
+    // An earlier revision of this exact fix checked `err.errorCode ===
+    // undefined` — but a body that parses fine with `error_code: ""` (or a
+    // whitespace-only string) sets errorCode to that empty/blank string,
+    // not undefined, so the strict check missed it. Confirmed by
+    // reproducing a keyed 409 with error_code: "" surfacing as an
+    // unretried, plain APIError.
+    for (const errorCode of ["", "   "]) {
+      let callCount = 0;
+      const impl: FetchLike = async (input, init) => {
+        callCount += 1;
+        if (callCount === 1) {
+          return {
+            ok: false,
+            status: 409,
+            headers: new Headers({ "Retry-After": "0" }),
+            text: () => Promise.resolve(JSON.stringify({ error_code: errorCode, message: "in flight" })),
+          } as unknown as Response;
+        }
+        return fetch(input, init);
+      };
+      mock.reset(() => jsonReply({ data: { taskId: "first" } }, 200, { "Idempotent-Replay": "true" }));
+      const created = await client({ fetch: impl, maxRetries: 1 }).tasks.create({
+        model: "m",
+        input: {},
+        idempotencyKey: `key-blank-code-${JSON.stringify(errorCode)}`,
+      });
+      assert.equal(created.taskId, "first", `errorCode=${JSON.stringify(errorCode)}`);
+      assert.equal(callCount, 2, `errorCode=${JSON.stringify(errorCode)}`);
+    }
+  });
+
+  test("a keyed 422 with an empty or whitespace-only error_code still surfaces IdempotencyKeyMismatchError", async () => {
+    for (const errorCode of ["", "   "]) {
+      const impl: FetchLike = async () =>
+        ({
+          ok: false,
+          status: 422,
+          headers: new Headers(),
+          text: () => Promise.resolve(JSON.stringify({ error_code: errorCode, message: "mismatch" })),
+        }) as unknown as Response;
+      await assert.rejects(
+        client({ fetch: impl, maxRetries: 0 }).tasks.create({
+          model: "m",
+          input: {},
+          idempotencyKey: `key-blank-code-422-${JSON.stringify(errorCode)}`,
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof IdempotencyKeyMismatchError, `errorCode=${JSON.stringify(errorCode)}`);
+          return true;
+        },
+      );
+    }
+  });
+
   test("an unreadable, ambiguous status (e.g. 400) never guesses a specific subclass — plain APIError, cause preserved", async () => {
     // A single status can carry SEVERAL distinct business meanings (400 is
     // both INVALID_REQUEST and MODEL_UNAVAILABLE) — with no error_code to
