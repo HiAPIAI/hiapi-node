@@ -132,6 +132,21 @@ export class Transport {
     const idempotencyKey = opts.extraHeaders?.[IDEMPOTENCY_KEY_HEADER]?.trim();
     const hasIdempotencyKey = Boolean(idempotencyKey);
     if (idempotencyKey) {
+      // Fetch header values are ByteString (Latin-1 only): a character
+      // above U+00FF makes the underlying `fetch` call throw a raw
+      // TypeError — confirmed via `node -e` — which is indistinguishable
+      // from a real network failure to the catch block below, so it gets
+      // misreported as APIConnectionError and, worse, retried pointlessly
+      // (the same non-ASCII key fails identically every attempt). Rejected
+      // with a clear, immediate, non-retryable error instead. Restricted to
+      // printable ASCII (not the full Latin-1 range fetch would accept) to
+      // sidestep runtime-specific header-validation differences entirely —
+      // an opaque idempotency token has no reason to need anything wider.
+      if (idempotencyKey.length > 255 || !/^[\x20-\x7E]+$/.test(idempotencyKey)) {
+        throw new RangeError(
+          `idempotencyKey must be a printable ASCII string of at most 255 characters, got ${JSON.stringify(idempotencyKey)}`,
+        );
+      }
       headers[IDEMPOTENCY_KEY_HEADER] = idempotencyKey;
     } else {
       delete headers[IDEMPOTENCY_KEY_HEADER];

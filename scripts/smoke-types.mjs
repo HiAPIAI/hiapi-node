@@ -38,9 +38,27 @@ const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
 // Windows, would be split into two arguments instead of staying intact).
 const TSC_JS = join(PACKAGE_ROOT, "node_modules/typescript/lib/tsc.js");
 // `npm` itself has no local JS entry point to fall back on the same way; on
-// Windows it's genuinely only reachable as `npm.cmd`, so resolve the binary
-// name per-platform instead and call it directly with no shell involved.
+// Windows it's genuinely only reachable as `npm.cmd`.
 const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
+
+// Node's own docs: ".bat and .cmd files are not executable on their own
+// without a terminal, and therefore cannot be launched using
+// child_process.execFile()" — so `execFileSync(NPM, args)` alone throws on
+// Windows. The docs' own recommended fix is spawning cmd.exe with `/c`, NOT
+// `shell: true` (Node deprecated passing an `args` array together with
+// `shell: true` as of v22.15.0/v23.11.0, precisely because that combination
+// does a naive, unsafe join rather than real shell-quoting). cmd.exe's `/c`
+// line reconstruction still isn't argv-safe for a value containing a space,
+// so anything that could contain one (a filesystem path) is individually
+// quoted here; every other argument passed to npm below is a hardcoded flag
+// with no spaces or shell metacharacters.
+function runNpm(args, options) {
+  if (process.platform !== "win32") {
+    return execFileSync(NPM, args, options);
+  }
+  const quoted = args.map((a) => (a.includes(" ") ? `"${a}"` : a));
+  return execFileSync("cmd.exe", ["/c", NPM, ...quoted], options);
+}
 
 const CONSUMER_SOURCE = `
 import { HiAPI, type CreateTaskParams } from "hiapi";
@@ -63,6 +81,15 @@ async function run(): Promise<void> {
   const params: CreateTaskParams = { model: "seedance-2-0", input, storage: "persistent" };
   await client.tasks.create(params);
 
+  // Same named-interface-without-index-signature shape, through the
+  // \`callback\` field this time (it had its own, separate regression).
+  interface CallbackConfig {
+    url: string;
+    when: "final";
+  }
+  const callback: CallbackConfig = { url: "https://example.com/cb", when: "final" };
+  await client.tasks.create({ model: "seedance-2-0", input, callback });
+
   console.log(created.taskId);
 }
 void run();
@@ -70,7 +97,7 @@ void run();
 
 const dir = mkdtempSync(join(tmpdir(), "hiapi-smoke-types-"));
 try {
-  const tarballName = execFileSync(NPM, ["pack", "--silent", `--pack-destination=${dir}`], {
+  const tarballName = runNpm(["pack", "--silent", `--pack-destination=${dir}`], {
     cwd: PACKAGE_ROOT,
   })
     .toString()
@@ -85,7 +112,7 @@ try {
     join(dir, "package.json"),
     JSON.stringify({ name: "smoke-consumer", private: true, type: "module" }),
   );
-  execFileSync(NPM, ["install", "--no-audit", "--no-fund", "--silent", tarballPath], { cwd: dir });
+  runNpm(["install", "--no-audit", "--no-fund", "--silent", tarballPath], { cwd: dir });
 
   const tscArgs = [
     TSC_JS,

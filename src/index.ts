@@ -47,6 +47,7 @@ export {
   IdempotencyKeyMismatchError,
   TaskFailedError,
   PollTimeoutError,
+  RunAbortedError,
   WebhookVerificationError,
 } from "./errors.js";
 

@@ -278,6 +278,38 @@ describe("network-error retry gates", () => {
   });
 });
 
+describe("idempotencyKey validation", () => {
+  // Fetch header values are ByteString (Latin-1 only): a character above
+  // U+00FF makes the real `fetch` throw a raw TypeError from inside the
+  // network-error catch block — confirmed via `node -e` — misreporting a
+  // pure client-side validation problem as APIConnectionError, and (for a
+  // GET-adjacent idempotent method, or with the key already attached) even
+  // retrying it pointlessly, since the same key fails identically every
+  // attempt. Rejected synchronously up front instead.
+  test("a non-ASCII idempotencyKey is rejected before any request is sent, not miscategorized as a network error", async () => {
+    await assert.rejects(
+      client().tasks.create({ model: "m", input: {}, idempotencyKey: "订单-8472" }),
+      RangeError,
+    );
+    assert.equal(mock.requests.length, 0);
+  });
+
+  test("an idempotencyKey over 255 characters is rejected the same way", async () => {
+    await assert.rejects(
+      client().tasks.create({ model: "m", input: {}, idempotencyKey: "a".repeat(256) }),
+      RangeError,
+    );
+    assert.equal(mock.requests.length, 0);
+  });
+
+  test("a plain printable-ASCII idempotencyKey at the 255-char boundary is accepted", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "t" } }));
+    const key = "a".repeat(255);
+    await client().tasks.create({ model: "m", input: {}, idempotencyKey: key });
+    assert.equal(mock.requests[0].headers["idempotency-key"], key);
+  });
+});
+
 describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {
   test("is retried automatically when the request carries a key", async () => {
     mock.reset((_req, index) =>

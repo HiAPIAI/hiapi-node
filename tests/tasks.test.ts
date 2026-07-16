@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
 
-import { HiAPI, HiAPIError, PollTimeoutError, TaskFailedError } from "../src/index.js";
+import {
+  HiAPI,
+  HiAPIError,
+  PollTimeoutError,
+  RunAbortedError,
+  TaskFailedError,
+} from "../src/index.js";
 import { jsonReply, startMock, type MockServer } from "./_server.js";
 
 let mock: MockServer;
@@ -113,6 +119,23 @@ describe("tasks.create", () => {
     assert.deepEqual(JSON.parse(mock.requests[0].body).input, input);
   });
 
+  // Same compile-time regression, through `callback`: it shipped typed as
+  // `JSONObject` (`Record<string, unknown>`) even after `input` was fixed,
+  // reintroducing the identical index-signature trap for this field alone —
+  // confirmed via `tsc` before the fix.
+  interface CallbackConfig {
+    url: string;
+    when: "final";
+  }
+
+  test("a named interface (no index signature) is accepted as callback without a cast", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "t" } }));
+    const callback: CallbackConfig = { url: "https://example.com/cb", when: "final" };
+    const created = await client().tasks.create({ model: "m", input: {}, callback });
+    assert.equal(created.taskId, "t");
+    assert.deepEqual(JSON.parse(mock.requests[0].body).callback, callback);
+  });
+
   test("Idempotent-Replay response header sets idempotentReplay", async () => {
     mock.reset(() => jsonReply({ data: { taskId: "t" } }, 200, { "Idempotent-Replay": "true" }));
     const created = await client().tasks.create({ model: "m", input: {}, idempotencyKey: "k" });
@@ -199,6 +222,20 @@ describe("tasks.list", () => {
     const page = await client().tasks.list();
     assert.deepEqual(page.items, []);
   });
+
+  test("a malformed (non-object, non-array) data value stays visible on .raw instead of being discarded", async () => {
+    // An earlier revision collapsed any non-object, non-array `data` to a
+    // bare `{}` before it ever reached TaskPage, so `.raw` — which
+    // TaskPage's own doc comment says always holds "the full, unparsed
+    // envelope" — silently lost the fact that the server sent something
+    // malformed at all, indistinguishable from a genuinely empty page.
+    for (const malformed of [null, "unexpected", 42, false]) {
+      mock.reset(() => jsonReply({ data: malformed }));
+      const page = await client().tasks.list();
+      assert.deepEqual(page.items, [], `malformed=${JSON.stringify(malformed)}`);
+      assert.deepEqual(page.raw, { data: malformed }, `malformed=${JSON.stringify(malformed)}`);
+    }
+  });
 });
 
 describe("tasks.wait", () => {
@@ -217,6 +254,40 @@ describe("tasks.wait", () => {
     assert.equal(task.status, "success");
     assert.deepEqual(seen, ["queued", "handling", "success"]);
     assert.equal(mock.requests.length, 4);
+  });
+
+  test("an async onUpdate is awaited: settles in order, and delays the next poll", async () => {
+    const sequence = ["queued", "handling", "success"];
+    mock.reset((_req, index) => statusReply(sequence[Math.min(index, sequence.length - 1)]));
+    const settleOrder: string[] = [];
+    const task = await client().tasks.wait("w1", {
+      pollIntervalMs: 1,
+      timeoutMs: 5_000,
+      onUpdate: async (t) => {
+        // A status-dependent delay: if onUpdate weren't awaited, "success"
+        // (0ms) would settle before "queued" (20ms) despite firing later —
+        // proving out-of-order settlement the same way a real, unawaited
+        // async callback would in production.
+        await new Promise((resolve) => setTimeout(resolve, t.status === "queued" ? 20 : 0));
+        settleOrder.push(t.status);
+      },
+    });
+    assert.equal(task.status, "success");
+    assert.deepEqual(settleOrder, ["queued", "handling", "success"]);
+  });
+
+  test("a rejecting onUpdate propagates out of wait() instead of becoming an unhandled rejection", async () => {
+    mock.reset(() => statusReply("queued"));
+    const boom = new Error("onUpdate boom");
+    await assert.rejects(
+      client().tasks.wait("w1", {
+        pollIntervalMs: 1,
+        onUpdate: async () => {
+          throw boom;
+        },
+      }),
+      (err: unknown) => err === boom,
+    );
   });
 
   test("terminal fail throws TaskFailedError carrying the task and code", async () => {
@@ -385,5 +456,55 @@ describe("tasks.run", () => {
     assert.equal(mock.requests[0].headers["idempotency-key"], "run-key");
     assert.equal(mock.requests[0].path, "/v1/tasks");
     assert.equal(mock.requests[1].path, "/v1/tasks/r1");
+  });
+
+  test("a pre-aborted signal is honoured before create() ever fires — no POST is sent", async () => {
+    // create() has no signal awareness of its own (a POST is never safe to
+    // abandon mid-flight — it may already have billed), so without this
+    // check, run() would still create a task from an already-aborted call.
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      client().tasks.run({ model: "m", input: {}, signal: controller.signal }),
+      (err: unknown) => {
+        assert.equal((err as Error).name, "AbortError");
+        return true;
+      },
+    );
+    assert.equal(mock.requests.length, 0);
+  });
+
+  test("an abort landing right after create() succeeds throws RunAbortedError carrying the taskId", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "r2" } }));
+    const controller = new AbortController();
+    const reason = new Error("cancelled by caller");
+    // A custom fetch that aborts the controller right as create()'s POST
+    // resolves — reproducing the exact race run() guards against: the
+    // signal fires in the window between the task existing server-side and
+    // run()'s post-create check running, with no mocked GET configured, so
+    // this also proves wait() is never reached (an unexpected request shape
+    // would otherwise fail the test).
+    const raceClient = new HiAPI({
+      apiKey: "sk-test",
+      baseUrl: mock.url,
+      timeoutMs: 5_000,
+      maxRetries: 0,
+      fetch: async (...args) => {
+        const resp = await fetch(...args);
+        controller.abort(reason);
+        return resp;
+      },
+    });
+    await assert.rejects(
+      raceClient.tasks.run({ model: "m", input: {}, signal: controller.signal }),
+      (err: unknown) => {
+        assert.ok(err instanceof RunAbortedError);
+        assert.equal(err.taskId, "r2");
+        assert.equal(err.cause, reason);
+        assert.match(err.message, /r2/);
+        return true;
+      },
+    );
+    assert.equal(mock.requests.length, 1);
   });
 });

@@ -97,10 +97,11 @@ resolved full name (`x@ext`).
 
 ## Idempotent retries
 
-Pass `idempotencyKey` (sent as the `Idempotency-Key` header, ≤255 bytes) to
-make task submission safe to retry — retrying the same key + same body within
-about 24 hours returns the first task instead of creating and billing a new one
-(after that the key is cleaned up and the same request creates a new task):
+Pass `idempotencyKey` (sent as the `Idempotency-Key` header — printable ASCII,
+≤255 characters) to make task submission safe to retry — retrying the same
+key + same body within about 24 hours returns the first task instead of
+creating and billing a new one (after that the key is cleaned up and the same
+request creates a new task):
 
 ```js
 const created = await client.tasks.create({
@@ -193,6 +194,7 @@ and a failed or crashed handler is simply redelivered.
 | `APIConnectionError` | network failure or client-side timeout (auto-retried for reads only — **not** a keyless `create()`) |
 | `TaskFailedError` | a polled task ended in `status=fail` (carries `task` and `code`) |
 | `PollTimeoutError` | `run()`/`wait()` exceeded its timeout (carries `taskId`) |
+| `RunAbortedError` | `run()`'s `signal` was aborted right after its task was created (carries `taskId` — the task exists and may still bill) |
 | `WebhookVerificationError` | bad signature or stale timestamp |
 
 429/503 are retried automatically with exponential backoff (`maxRetries`,

@@ -1,6 +1,6 @@
 /** The `client.tasks` resource — the unified async task API (/v1/tasks). */
 
-import { HiAPIError, PollTimeoutError, TaskFailedError } from "./errors.js";
+import { HiAPIError, PollTimeoutError, RunAbortedError, TaskFailedError } from "./errors.js";
 import { CreatedTask, Task, TaskPage } from "./models.js";
 import type { JSONObject } from "./models.js";
 import { IDEMPOTENCY_KEY_HEADER, MAX_TIMER_DELAY_MS, sleep, Transport } from "./transport.js";
@@ -24,8 +24,14 @@ export interface CreateTaskParams {
    * `object` constraint has no such gap).
    */
   input: object;
-  /** Webhook target, e.g. `{ url: "https://...", when: "final" }`. */
-  callback?: JSONObject;
+  /**
+   * Webhook target, e.g. `{ url: "https://...", when: "final" }`.
+   *
+   * Typed as plain `object`, not `Record<string, unknown>` — same reason as
+   * `input` above: a named `interface` (no index signature) isn't otherwise
+   * structurally assignable here without a cast.
+   */
+  callback?: object;
   /**
    * Selects a model route (e.g. `"ext"`) without writing the `model@route`
    * suffix form: `model: "x", route: "ext"` is the preferred spelling of
@@ -42,8 +48,12 @@ export interface CreateTaskParams {
    */
   storage?: "temp" | "persistent";
   /**
-   * Sent as the `Idempotency-Key` header (at most 255 bytes); makes retries
-   * safe. Resending the same key + body returns the original task
+   * Sent as the `Idempotency-Key` header: printable ASCII only, at most 255
+   * characters (a non-ASCII character — e.g. `"订单-8472"` — is rejected
+   * before the request is sent, since the underlying `fetch` header value
+   * can only hold Latin-1 bytes and would otherwise throw a raw `TypeError`
+   * deep inside the transport instead of a clear, immediate error). Makes
+   * retries safe: resending the same key + body returns the original task
    * (`CreatedTask.idempotentReplay` is then `true`) instead of creating and
    * billing a second one. The transport also becomes willing to retry this
    * POST on network errors. Reusing a key with a *different* body throws
@@ -62,7 +72,23 @@ export interface WaitOptions {
    * is NOT cancelled and may still complete (and bill).
    */
   timeoutMs?: number;
-  /** Called once per status change while waiting; receives the latest Task. */
+  /**
+   * Called once per status change while waiting; receives the latest Task.
+   *
+   * Its result is awaited before the poll loop continues — deliberately
+   * still typed as returning plain `void` (not `void | Promise<void>`,
+   * which — confirmed via `tsc` — stops TypeScript from also permitting a
+   * *synchronous* callback that returns a non-void value, e.g. the common
+   * `onUpdate: (t) => seen.push(t.status)`; `void` alone keeps accepting
+   * both, since TS's "ignore the return value" rule for a `void`-typed
+   * callback already covers a `Promise` too). Passing an `async` function
+   * therefore still type-checks with no ceremony, and at runtime it's
+   * actually awaited: a slow one delays the next poll rather than racing
+   * it, and a rejection propagates out of `wait()`/`run()` instead of
+   * becoming an unhandled promise rejection (confirmed: without awaiting,
+   * two status changes firing back-to-back could have their callbacks
+   * settle out of order).
+   */
   onUpdate?: (task: Task) => void;
   /**
    * Aborts the poll loop (not the task) when triggered. Not forwarded into
@@ -155,13 +181,23 @@ export class Tasks {
     const page = params.page ?? 1;
     const size = params.size ?? 20;
     const env = await this.transport.request("GET", "/tasks", { params: { page, size } });
-    let d: unknown = env.data;
-    if (Array.isArray(d)) {
-      d = { items: d, page, size };
-    } else if (typeof d !== "object" || d === null) {
-      d = {};
+    const rawData = env.data;
+    let d: JSONObject;
+    if (Array.isArray(rawData)) {
+      d = { items: rawData, page, size };
+    } else if (typeof rawData === "object" && rawData !== null) {
+      d = rawData as JSONObject;
+    } else {
+      // Neither an array nor an object (null, a string, a number, a
+      // boolean): TaskPage.fromJSON needs a JSONObject to extract items
+      // from, but wrapping the true value here — instead of discarding it
+      // as `{}` the way an earlier revision did — keeps it visible on
+      // `.raw`, so a caller can still tell a genuinely empty page apart
+      // from the server (or a proxy in between) sending something
+      // malformed. See TaskPage's own doc comment on `.raw`.
+      d = { data: rawData };
     }
-    return TaskPage.fromJSON(d as JSONObject);
+    return TaskPage.fromJSON(d);
   }
 
   /**
@@ -222,7 +258,7 @@ export class Tasks {
       options.signal?.throwIfAborted();
       if (options.onUpdate && task.status !== lastStatus) {
         lastStatus = task.status;
-        options.onUpdate(task);
+        await options.onUpdate(task);
       }
       if (task.status === "success") {
         return task;
@@ -245,9 +281,22 @@ export class Tasks {
    *
    * Equivalent to {@link create} followed by {@link wait}. `callback` is
    * optional and independent of polling; set it if you also want a webhook.
+   *
+   * `signal` is checked before `create()` is ever called and again right
+   * after — `create()` has no signal awareness of its own (there is no
+   * in-flight request to cancel; a `POST /tasks` is not safe to abandon
+   * mid-flight since it may already have billed), so without both checks an
+   * already-aborted `signal` would still let the task get created, and an
+   * abort landing during creation would only surface once `wait()`'s own
+   * check ran — as a plain `AbortError` with no way to recover the `taskId`
+   * of the task that now exists. See {@link RunAbortedError}.
    */
   async run(params: RunParams): Promise<Task> {
+    params.signal?.throwIfAborted();
     const created = await this.create(params);
+    if (params.signal?.aborted) {
+      throw new RunAbortedError(created.taskId, { cause: params.signal.reason });
+    }
     return this.wait(created.taskId, {
       pollIntervalMs: params.pollIntervalMs,
       timeoutMs: params.timeoutMs,

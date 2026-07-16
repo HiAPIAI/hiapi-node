@@ -16,6 +16,7 @@
  *     ├── APIConnectionError           network failure / DNS / connection reset / timeout
  *     ├── TaskFailedError              a polled task reached terminal status=fail
  *     ├── PollTimeoutError             run()/wait() exceeded the client-side timeout
+ *     ├── RunAbortedError              run()'s signal was aborted after task creation
  *     └── WebhookVerificationError     callback signature / timestamp check failed
  */
 
@@ -191,6 +192,28 @@ export class PollTimeoutError extends HiAPIError {
     this.name = "PollTimeoutError";
     this.taskId = taskId;
     this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * `run()`'s `signal` was already aborted — either before `create()` was
+ * called, or while it was in flight — by the time the task had actually been
+ * created. Distinct from the plain `AbortError` thrown for an abort during
+ * `wait()`'s polling (there is no task to lose track of in that case): the
+ * task here does exist and may still run and bill, so this carries `taskId`
+ * so the caller isn't left unable to find it.
+ */
+export class RunAbortedError extends HiAPIError {
+  readonly taskId: string;
+
+  constructor(taskId: string, options?: ErrorOptions) {
+    super(
+      `run() was aborted after task ${taskId} was already created — it may ` +
+        `still run and bill; poll tasks.retrieve("${taskId}") to check on it`,
+      options,
+    );
+    this.name = "RunAbortedError";
+    this.taskId = taskId;
   }
 }
 
