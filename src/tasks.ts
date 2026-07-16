@@ -92,19 +92,31 @@ export interface WaitOptions {
    * actually awaited: a rejection propagates out of `wait()`/`run()` instead
    * of becoming an unhandled promise rejection, and two status changes
    * firing back-to-back settle in order rather than racing (confirmed by
-   * reproducing both without awaiting). The wait, in turn, is itself raced
-   * against `signal` and the remaining `timeoutMs` budget — a hanging
-   * (never-settling) `onUpdate` doesn't block `wait()` past either one
+   * reproducing both without awaiting). The wait is also raced against
+   * `signal` — an abort stops it promptly instead of leaving it pending
    * (confirmed by reproducing exactly that with a callback that never
-   * resolves).
+   * resolves). For a NON-terminal status, it's additionally raced against
+   * the remaining `timeoutMs` budget, rejecting with {@link PollTimeoutError}
+   * if the callback outlasts it. A *terminal* (`success`/`fail`) status's
+   * call is NOT raced against `timeoutMs`, only `signal`: at that point
+   * `wait()` already has the real, final answer in hand, and there is no
+   * safe way to "give up" on an in-flight callback call without either
+   * hanging anyway or silently discarding whatever it was about to do or
+   * report (confirmed both ways) — so it always runs to completion (or
+   * until aborted). If you need to bound a terminal `onUpdate` call
+   * specifically, pass `signal` (e.g. from `AbortSignal.timeout(...)`).
    */
   onUpdate?: (task: Task) => void;
   /**
-   * Aborts the poll loop (not the task) when triggered. Not forwarded into
-   * the in-flight HTTP request, so aborting while a `retrieve` call is
-   * already underway lets that one request finish — but the abort is then
-   * honoured immediately once it resolves, before `onUpdate` fires or a
-   * terminal result is returned/thrown.
+   * Aborts the poll loop (not the task) when triggered. Forwarded into the
+   * transport, so it interrupts an in-flight HTTP request, a pending
+   * retry-backoff sleep, and any subsequent retry attempt's request — an
+   * abort landing mid-retry (during a 429/503's `Retry-After` wait, say) is
+   * honoured promptly rather than only once the whole `retrieve` call,
+   * retries included, finally settles. Never resurrects a network-error
+   * retry the request's own idempotency rules wouldn't already allow: this
+   * only interrupts requests `wait()`/`retrieve()` were already making
+   * safely.
    */
   signal?: AbortSignal;
 }
@@ -166,9 +178,17 @@ export class Tasks {
     return created;
   }
 
-  /** Fetch a task's current status and (when `success`) its output. */
-  async retrieve(taskId: string): Promise<Task> {
-    const env = await this.transport.request("GET", "/tasks/" + encodeURIComponent(taskId));
+  /**
+   * Fetch a task's current status and (when `success`) its output.
+   *
+   * `signal`, if given, aborts this specific request (including any pending
+   * retry-backoff sleep) — used internally by {@link wait} so an abort lands
+   * promptly even mid-retry, not just between polls.
+   */
+  async retrieve(taskId: string, signal?: AbortSignal): Promise<Task> {
+    const env = await this.transport.request("GET", "/tasks/" + encodeURIComponent(taskId), {
+      signal,
+    });
     const task = Task.fromJSON(data(env));
     // A 2xx here is only trustworthy if it's actually describing the task we
     // asked about — without this check, a malformed/mismatched response
@@ -251,7 +271,14 @@ export class Tasks {
     let lastStatus: string | undefined;
     for (;;) {
       options.signal?.throwIfAborted();
-      const task = await this.retrieve(taskId);
+      // `options.signal` passed straight through to retrieve() — without
+      // this, an abort landing mid-retry (during a 429/503's Retry-After
+      // sleep, or while a subsequent retry attempt's request is in flight)
+      // wasn't observed until this call finally settled, since the
+      // throwIfAborted() checks in this loop only run BETWEEN calls
+      // (confirmed by reproducing an abort during a Retry-After sleep: two
+      // more HTTP attempts happened before it was honoured).
+      const task = await this.retrieve(taskId, options.signal);
       // Re-checked here, not just at the top of the loop: the signal could
       // have been aborted while the `await` above was in flight, and without
       // this the abort wouldn't be honoured until after onUpdate fires and a
@@ -259,22 +286,33 @@ export class Tasks {
       options.signal?.throwIfAborted();
       if (options.onUpdate && task.status !== lastStatus) {
         lastStatus = task.status;
-        // For a *terminal* status, `onDeadline: "abandon"` means the
-        // polling deadline elapsing gives up on `onUpdate` (resolves)
-        // rather than rejecting: `retrieve()` above already has the real
-        // answer (success/fail) in hand, so a merely-slow callback racing
-        // past the deadline must never turn a task that has already
-        // finished into a false PollTimeoutError (confirmed by reproducing
-        // exactly that). `signal` is still raced the same way either way —
-        // an explicit abort is a request to stop caring about this task,
-        // terminal or not.
+        // The polling `deadline` deliberately does NOT apply to a
+        // *terminal* status's onUpdate call — only `signal` does. `timeoutMs`
+        // bounds the POLLING loop's budget; `retrieve()` above already has
+        // the real answer (success/fail) in hand once we're here, so a
+        // merely-slow callback racing past the deadline must never turn an
+        // already-finished task into a false PollTimeoutError (confirmed by
+        // reproducing exactly that in an earlier revision). A prior revision
+        // tried an "abandon at the deadline, but keep the poll's overall
+        // timeoutMs as a ceiling anyway" middle ground for this — that
+        // turned out to have no correct answer: giving up on WAITING for
+        // onUpdate necessarily means *some* eventual outcome (a rejection,
+        // in particular) has nowhere left to go once wait() has already
+        // moved on, so any such "give up but stay safe" scheme either hangs
+        // anyway or silently swallows a real callback failure — confirmed by
+        // reproducing exactly the latter (a terminal onUpdate rejecting
+        // right at an already-elapsed deadline was silently discarded,
+        // `wait()` still resolving with the terminal task as if nothing had
+        // gone wrong). Full completion is therefore always awaited: if you
+        // need to bound a terminal onUpdate call specifically, pass `signal`
+        // (e.g. from `AbortSignal.timeout(...)`) — the one mechanism that
+        // can end the wait safely, without discarding anything.
         await raceOnUpdate(
-          options.onUpdate(task),
+          () => options.onUpdate!(task),
           options.signal,
           taskId,
           timeoutMs,
-          deadline,
-          task.isTerminal ? "abandon" : "reject",
+          task.isTerminal ? Infinity : deadline,
         );
         // Re-checked once more: onUpdate settling normally doesn't itself
         // prove the signal wasn't aborted in the same tick it resolved —
@@ -403,47 +441,37 @@ function validateWaitOptions(pollIntervalMs: number, timeoutMs: number): void {
 }
 
 /**
- * Awaits `onUpdate`'s result, but loses the race to whichever comes first:
- * `signal` aborting, or `deadline` elapsing. A plain `await
- * options.onUpdate(task)` does neither — it doesn't listen for the signal at
- * all, and doesn't race the deadline either, so a hanging (never-settling)
- * `onUpdate` — or merely one slower than the remaining budget — blocked
- * `wait()` past both controls entirely (confirmed by reproducing exactly
- * that: a never-settling callback stayed pending well past both an already-
- * elapsed `timeoutMs` and a `signal` aborted during the call).
+ * Calls `onUpdate` and awaits its result, but loses the race to whichever
+ * comes first: `signal` aborting, or `deadline` elapsing. A plain `await
+ * onUpdate()` does neither — it doesn't listen for the signal at all, and
+ * doesn't race the deadline either, so a hanging (never-settling) `onUpdate`
+ * — or merely one slower than the remaining budget — blocked `wait()` past
+ * both controls entirely (confirmed by reproducing exactly that: a
+ * never-settling callback stayed pending well past both an already-elapsed
+ * `timeoutMs` and a `signal` aborted during the call).
  *
- * `onDeadline` controls what happens if `deadline` is the one that wins:
- * `"reject"` (the default, for a non-terminal status) rejects with
- * `PollTimeoutError`. `"abandon"` (for a terminal status) resolves instead —
- * `retrieve()` already has the real success/fail answer in hand at that
- * point, so a merely-slow callback must never turn an already-finished task
- * into a false timeout; onUpdate itself is simply given up on; the caller's
- * own `signal`, if any, is still the only way to actually stop waiting for
- * an onUpdate that never settles at all.
+ * Takes a THUNK (`() => onUpdate(task)`), not the already-called result —
+ * `options.onUpdate(task)` evaluated as a plain argument runs BEFORE this
+ * function's body ever does, so a synchronous throw (a caller re-raising an
+ * SDK error, say) would escape entirely uncaught by anything in here,
+ * bypassing both the deadline/signal race and the {@link CALLBACK_ORIGINATED}
+ * marking below — confirmed by reproducing a synchronously-thrown, same-
+ * taskId `PollTimeoutError` passing straight through unmarked. Calling the
+ * thunk inside this function's own `try` normalizes a synchronous throw into
+ * the same rejected-Promise path as an asynchronous one.
  */
 function raceOnUpdate(
-  result: void | Promise<void>,
+  callback: () => void | Promise<void>,
   signal: AbortSignal | undefined,
   taskId: string,
   timeoutMs: number,
   deadline: number,
-  onDeadline: "reject" | "abandon" = "reject",
 ): Promise<void> {
-  const settledResult = Promise.resolve(result);
-  if (!signal && !Number.isFinite(deadline)) {
-    return settledResult;
-  }
-  // Checked synchronously up front, not just via the "abort" listener below:
-  // `signal` can already be aborted by the time this is called (e.g. the
-  // caller's own `onUpdate` triggers the abort synchronously, before this
-  // function ever runs) — the "abort" event only fires once, so registering
-  // a listener for it afterwards would never see it, and this call would
-  // otherwise just wait out the original promise instead of rejecting
-  // immediately.
-  if (signal?.aborted) {
-    return Promise.reject(
-      signal.reason ?? new DOMException("This operation was aborted", "AbortError"),
-    );
+  let settledResult: Promise<void>;
+  try {
+    settledResult = Promise.resolve(callback());
+  } catch (err) {
+    settledResult = Promise.reject(err);
   }
   return new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -460,17 +488,31 @@ function raceOnUpdate(
       cleanup();
       reject(signal!.reason ?? new DOMException("This operation was aborted", "AbortError"));
     };
-    // Registered BEFORE arming the deadline timer below, not after: arming
-    // can synchronously detect an already-elapsed deadline (its very first,
-    // synchronous call) and call cleanup() immediately — cleanup() calls
-    // removeEventListener for a listener that, had this ordering been
-    // reversed, wouldn't have been added yet. Execution would then fall
-    // through to an addEventListener call AFTER settled was already true,
-    // registering a listener nothing ever removes: confirmed by reproducing
-    // exactly that with one AbortController reused across several
-    // already-timed-out waits, each leaking one more listener on it.
+    // The `settledResult.then()` handler below is attached UNCONDITIONALLY,
+    // before any early return for an already-aborted signal — an earlier
+    // revision returned `Promise.reject(...)` immediately for that case
+    // without ever attaching a handler to `settledResult` (which, since the
+    // caller's `onUpdate` already ran to produce it, could itself already be
+    // a rejected Promise): that rejection then had no handler at all,
+    // surfacing as a process-level `unhandledRejection` (confirmed: an
+    // onUpdate that synchronously aborted `signal` and then returned a
+    // rejected Promise produced exactly that, even though `wait()` itself
+    // correctly threw `AbortError`).
+    //
+    // The abort listener is registered BEFORE arming the deadline timer
+    // below, not after, for a separate reason: arming can synchronously
+    // detect an already-elapsed deadline on its very first call and call
+    // cleanup() immediately — cleanup() calls removeEventListener for a
+    // listener that, had this ordering been reversed, wouldn't exist yet.
+    // Execution would then fall through to registering the listener AFTER
+    // settled was already true, leaking it forever (confirmed by
+    // reproducing one `AbortController` reused across several
+    // already-timed-out waits, each leaking one more listener on it).
     signal?.addEventListener("abort", onAbort, { once: true });
-    if (Number.isFinite(deadline)) {
+    if (signal?.aborted) {
+      cleanup();
+      reject(signal.reason ?? new DOMException("This operation was aborted", "AbortError"));
+    } else if (Number.isFinite(deadline)) {
       // A single `setTimeout` can't span more than Node's real (signed
       // 32-bit) timer limit (`MAX_TIMER_DELAY_MS`, ~24.85 days) — clamping
       // just the FIRST segment's duration and treating its firing as "the
@@ -478,7 +520,7 @@ function raceOnUpdate(
       // days early for any `timeoutMs` beyond that (an explicitly supported
       // value — `wait()` allows `timeoutMs: Infinity`, and any long-running
       // `timeoutMs` in between): confirmed by tracing a 30-day `timeoutMs`
-      // through the earlier single-`setTimeout` version. Re-arming against
+      // through an earlier single-`setTimeout` version. Re-arming against
       // the true remaining time on each firing — instead of one clamped
       // `setTimeout` — makes an arbitrarily long `timeoutMs` wait out its
       // full, correct duration.
@@ -487,11 +529,7 @@ function raceOnUpdate(
         if (remainingMs <= 0) {
           if (settled) return;
           cleanup();
-          if (onDeadline === "abandon") {
-            resolve();
-          } else {
-            reject(new PollTimeoutError(taskId, timeoutMs));
-          }
+          reject(new PollTimeoutError(taskId, timeoutMs));
           return;
         }
         timer = setTimeout(armTimer, Math.min(remainingMs, MAX_TIMER_DELAY_MS));
@@ -510,7 +548,8 @@ function raceOnUpdate(
         // Marked here specifically — not for the PollTimeoutError/
         // AbortError raceOnUpdate itself produces above for a genuine
         // deadline/signal reason — because this is precisely "onUpdate's
-        // own promise rejected": the only place that distinction can be
+        // own promise rejected" (or, per the thunk change above, "onUpdate
+        // threw synchronously"): the only place that distinction can be
         // made. run()'s catch needs it to tell an error that came from
         // INSIDE onUpdate (even an SDK error type with a matching taskId —
         // e.g. onUpdate does its own nested wait() for the very same task,

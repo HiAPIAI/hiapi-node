@@ -182,6 +182,67 @@ describe("HTTP status retries (429/503)", () => {
   });
 });
 
+describe("abort during retry", () => {
+  // wait()'s own throwIfAborted() checks only run BETWEEN retrieve() calls —
+  // without threading `signal` all the way into the transport, an abort
+  // landing during a 429/503's Retry-After sleep, or while a subsequent
+  // retry attempt's request was already in flight, went unnoticed until that
+  // whole retrieve() call finally settled (confirmed by reproducing an abort
+  // during a Retry-After sleep: two more HTTP attempts happened before it
+  // was ever honoured).
+  test("an abort during a 429's Retry-After sleep is honoured immediately — no further retry attempts", async () => {
+    mock.reset(() => jsonReply({ message: "slow down" }, 429, { "Retry-After": "5" }));
+    const controller = new AbortController();
+    const started = performance.now();
+    const waiting = client().tasks.wait("w1", { pollIntervalMs: 60_000, signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(waiting, (err: unknown) => {
+      assert.equal((err as Error).name, "AbortError");
+      return true;
+    });
+    // The mocked Retry-After is 5s; if the abort weren't honoured until the
+    // sleep finished naturally, this would take >=5000ms.
+    assert.ok(performance.now() - started < 2_000);
+    assert.equal(mock.requests.length, 1);
+  });
+
+  test("an abort during a network-error retry's backoff sleep is honoured immediately", async () => {
+    const flaky: FetchLike = async () => {
+      throw new TypeError("fetch failed");
+    };
+    const controller = new AbortController();
+    const started = performance.now();
+    const waiting = client({ fetch: flaky }).tasks.wait("w1", {
+      pollIntervalMs: 60_000,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(waiting, (err: unknown) => {
+      assert.equal((err as Error).name, "AbortError");
+      return true;
+    });
+    assert.ok(performance.now() - started < 5_000);
+  });
+
+  test("a genuine per-request timeout still surfaces as APIConnectionError, not an AbortError, when signal is also present but not aborted", async () => {
+    // Combining `opts.signal` with the per-attempt AbortSignal.timeout() via
+    // AbortSignal.any() must not blur which one actually fired — a timeout
+    // with signal present-but-never-aborted should behave identically to no
+    // signal at all. Uses the real mock HTTP server (a genuine, unmocked
+    // `fetch`, which — unlike a hand-written stub — actually honours
+    // whatever AbortSignal it's given) with a handler that never responds,
+    // so the per-attempt client-side timeout is what actually fires here.
+    mock.reset(() => new Promise(() => {}));
+    await assert.rejects(
+      client({ timeoutMs: 30, maxRetries: 0 }).tasks.wait("w1", {
+        pollIntervalMs: 60_000,
+        signal: new AbortController().signal,
+      }),
+      APIConnectionError,
+    );
+  });
+});
+
 describe("retryDelayMs", () => {
   test("numeric Retry-After in seconds, clamped to [0, 60s]", () => {
     assert.equal(retryDelayMs(0, new Headers({ "retry-after": "2" })), 2_000);

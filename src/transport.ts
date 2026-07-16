@@ -61,6 +61,20 @@ export interface RequestOptions {
   body?: JSONObject;
   params?: Record<string, string | number | boolean | undefined>;
   extraHeaders?: Record<string, string>;
+  /**
+   * Aborts the CURRENT attempt's in-flight request and any pending
+   * retry-backoff sleep — but never a request already known to have
+   * completed successfully (2xx is always returned, never discarded).
+   * Without this, `tasks.wait()`'s `signal` had no way to reach the
+   * transport at all: an abort during a retry-after sleep, or while a
+   * subsequent retry attempt's request was in flight, was silently ignored
+   * — the poll loop's own `throwIfAborted()` checks only run BETWEEN
+   * `retrieve()` calls, so the caller's abort could sit unhonoured for the
+   * full remaining retry budget (confirmed by reproducing an abort landing
+   * during a 429's `Retry-After` sleep: two more HTTP attempts happened
+   * before the abort was ever observed).
+   */
+  signal?: AbortSignal;
 }
 
 export class Transport {
@@ -193,6 +207,15 @@ export class Transport {
 
     let attempt = 0;
     for (;;) {
+      // A per-attempt combination, not reused across retries: AbortSignal.any()
+      // documents that a signal composed this way carries no obligation to
+      // ever be cleaned up beyond the attempt it was created for, and a
+      // fresh AbortSignal.timeout(this.timeoutMs) — this request's own
+      // per-attempt timeout budget — is exactly as unsafe to reuse across
+      // attempts as it already was before `signal` existed.
+      const attemptSignal = opts.signal
+        ? AbortSignal.any([opts.signal, AbortSignal.timeout(this.timeoutMs)])
+        : AbortSignal.timeout(this.timeoutMs);
       let status: number;
       let respHeaders: Headers;
       let rawText: string;
@@ -201,7 +224,7 @@ export class Transport {
           method,
           headers,
           body: bodyText,
-          signal: AbortSignal.timeout(this.timeoutMs),
+          signal: attemptSignal,
         });
         if (resp.ok) {
           const text = await resp.text();
@@ -216,11 +239,18 @@ export class Transport {
         if (err instanceof HiAPIError) {
           throw err;
         }
+        // The CALLER's signal (not the per-attempt timeout, which produces
+        // the identical DOMException shape) firing must surface as a plain
+        // abort, not get wrapped in APIConnectionError or retried — the
+        // caller asked to stop, not "the network failed, try again".
+        if (opts.signal?.aborted) {
+          throw opts.signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+        }
         // Anything else fetch throws is network-level: DNS, refused/reset
         // connections, TLS failures, or the AbortSignal.timeout firing. Only
         // retry when the request is safe to repeat (see gate above).
         if (retryOnNetworkError && attempt < this.maxRetries) {
-          await sleep(retryDelayMs(attempt, null));
+          await sleep(retryDelayMs(attempt, null), opts.signal);
           attempt += 1;
           continue;
         }
@@ -230,7 +260,7 @@ export class Transport {
       }
 
       if (RETRY_STATUSES.has(status) && attempt < this.maxRetries) {
-        await sleep(retryDelayMs(attempt, respHeaders));
+        await sleep(retryDelayMs(attempt, respHeaders), opts.signal);
         attempt += 1;
         continue;
       }
@@ -244,7 +274,7 @@ export class Transport {
         err.errorCode === IDEMPOTENCY_PROCESSING_CODE &&
         attempt < this.maxRetries
       ) {
-        await sleep(retryDelayMs(attempt, respHeaders));
+        await sleep(retryDelayMs(attempt, respHeaders), opts.signal);
         attempt += 1;
         continue;
       }

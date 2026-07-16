@@ -398,37 +398,49 @@ describe("tasks.wait", () => {
     );
   });
 
-  test("a hanging (never-settling) onUpdate for a terminal status is abandoned at the deadline — the real result still comes back, not a hang", async () => {
-    // A round-9 regression in the OTHER direction from the two tests above:
-    // giving the terminal onUpdate call an unbounded (Infinity) deadline
-    // fixed the false-timeout bug, but meant a genuinely hanging callback
-    // with no AbortSignal at all would then block forever, contradicting
-    // wait()'s own documented timeoutMs budget. onDeadline: "abandon" gives
-    // up waiting on onUpdate once the (real, finite) deadline elapses —
-    // still returning the already-known terminal result.
+  test("a terminal-status onUpdate is NOT bound by timeoutMs at all — it runs to completion (deliberate: there is no safe way to abandon it)", async () => {
+    // A round-9 revision tried giving up on a hanging terminal callback once
+    // the deadline elapsed — that turned out to have no correct answer:
+    // giving up on WAITING necessarily means an eventual rejection has
+    // nowhere left to go once wait() has already moved on, so it either
+    // hangs anyway or silently discards a real callback failure (confirmed
+    // by reproducing the latter: a terminal onUpdate rejecting right at an
+    // already-elapsed deadline was silently discarded, wait() still
+    // resolving as if nothing had gone wrong). A terminal onUpdate that
+    // rejects well past a short timeoutMs must still surface that rejection
+    // — proving completion is awaited in full, not raced against the
+    // deadline at all.
     mock.reset(() => statusReply("success"));
-    const started = performance.now();
-    const task = await client().tasks.wait("w1", {
-      pollIntervalMs: 5,
-      timeoutMs: 20,
-      onUpdate: () => new Promise<void>(() => {}),
-    });
-    assert.equal(task.status, "success");
-    assert.ok(performance.now() - started < 5_000);
-  });
-
-  test("a hanging (never-settling) onUpdate for a terminal fail status is abandoned at the deadline — TaskFailedError still throws, not a hang", async () => {
-    mock.reset(() => statusReply("fail", { error: { code: "X", message: "boom" } }));
-    const started = performance.now();
+    const boom = new Error("persist failed");
     await assert.rejects(
       client().tasks.wait("w1", {
         pollIntervalMs: 5,
-        timeoutMs: 20,
-        onUpdate: () => new Promise<void>(() => {}),
+        timeoutMs: 10,
+        onUpdate: () => new Promise<void>((_, reject) => setTimeout(() => reject(boom), 30)),
       }),
-      TaskFailedError,
+      (err: unknown) => err === boom,
     );
-    assert.ok(performance.now() - started < 5_000);
+  });
+
+  test("a terminal-status onUpdate that never settles is bounded only by signal, not by timeoutMs", async () => {
+    mock.reset(() => statusReply("success"));
+    const controller = new AbortController();
+    const started = performance.now();
+    const waiting = client().tasks.wait("w1", {
+      pollIntervalMs: 5,
+      timeoutMs: 10,
+      signal: controller.signal,
+      onUpdate: () => new Promise<void>(() => {}),
+    });
+    setTimeout(() => controller.abort(), 30);
+    await assert.rejects(waiting, (err: unknown) => {
+      assert.equal((err as Error).name, "AbortError");
+      return true;
+    });
+    // Aborted at 30ms, well past the 10ms timeoutMs — proving it was the
+    // signal that ended the wait, not (as PollTimeoutError would indicate) a
+    // deadline race.
+    assert.ok(performance.now() - started >= 25);
   });
 
   test("a timed-out onUpdate race doesn't leak its AbortSignal listener", async () => {
@@ -453,6 +465,66 @@ describe("tasks.wait", () => {
       );
     }
     assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+
+  test("onUpdate synchronously aborting signal and then rejecting doesn't produce an unhandledRejection", async () => {
+    // An earlier revision returned Promise.reject(...) for an already-aborted
+    // signal WITHOUT first attaching a handler to onUpdate's own (already
+    // rejected, since onUpdate already ran by the time this check happens)
+    // promise — that rejection then had no handler anywhere, surfacing as a
+    // process-level unhandledRejection (which, unhandled, can crash the
+    // process under default Node configuration) even though wait() itself
+    // correctly threw AbortError.
+    mock.reset(() => statusReply("queued"));
+    const controller = new AbortController();
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const boom = new Error("callback boom");
+      await assert.rejects(
+        client().tasks.wait("w1", {
+          pollIntervalMs: 60_000,
+          timeoutMs: 120_000,
+          signal: controller.signal,
+          onUpdate: () => {
+            controller.abort();
+            return Promise.reject(boom);
+          },
+        }),
+        (err: unknown) => {
+          assert.equal((err as Error).name, "AbortError");
+          return true;
+        },
+      );
+      // Give a microtask/macrotask turn for a real unhandledRejection to
+      // surface before asserting its absence.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  test("a SYNCHRONOUSLY-thrown same-taskId SDK error from onUpdate is still marked as callback-originated (not just an async rejection)", async () => {
+    // options.onUpdate(task) evaluated as a plain call argument runs BEFORE
+    // raceOnUpdate's own body — so a synchronous throw used to bypass
+    // raceOnUpdate's rejection handler (and its CALLBACK_ORIGINATED marking)
+    // entirely, reaching run()'s catch unmarked and indistinguishable from
+    // the outer wait() loop's own error of the same type and taskId.
+    // wait() itself is tested here directly (a lower-level unit of the same
+    // marking mechanism than the full run() integration test below).
+    mock.reset(() => statusReply("queued"));
+    const sameTaskIdError = new PollTimeoutError("w1", 999);
+    await assert.rejects(
+      client().tasks.wait("w1", {
+        pollIntervalMs: 1,
+        onUpdate: () => {
+          throw sameTaskIdError;
+        },
+      }),
+      (err: unknown) => err === sameTaskIdError,
+    );
   });
 
   test("a timeoutMs beyond Node's single-timer limit doesn't crash or misfire when onUpdate resolves normally", async () => {
@@ -918,6 +990,36 @@ describe("tasks.run", () => {
         assert.equal(err.taskId, "real");
         assert.ok(err.cause instanceof PollTimeoutError);
         assert.equal((err.cause as PollTimeoutError).taskId, "real");
+        return true;
+      },
+    );
+  });
+
+  test("a SYNCHRONOUSLY-thrown same-taskId PollTimeoutError from onUpdate is still wrapped in RunFailedError (not just the async case)", async () => {
+    // The full run() integration counterpart to the wait()-level test above:
+    // a synchronous throw from onUpdate (as opposed to a nested wait()'s
+    // async rejection) used to bypass the marking mechanism entirely and
+    // reach run()'s catch unmarked — where taskId-only matching then let it
+    // through as if it were the outer wait() loop's own timeout.
+    mock.reset((_req, index) =>
+      index === 0
+        ? jsonReply({ data: { taskId: "real" } })
+        : jsonReply({ data: { taskId: "real", model: "m", status: "queued" } }),
+    );
+    const sameTaskIdError = new PollTimeoutError("real", 1);
+    await assert.rejects(
+      client().tasks.run({
+        model: "m",
+        input: {},
+        pollIntervalMs: 1,
+        onUpdate: () => {
+          throw sameTaskIdError;
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RunFailedError);
+        assert.equal(err.taskId, "real");
+        assert.equal(err.cause, sameTaskIdError);
         return true;
       },
     );
