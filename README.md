@@ -50,6 +50,28 @@ task — it may still finish (and bill) later; take `taskId` from the
 `PollTimeoutError` and `retrieve()` it instead of submitting the same request
 again.
 
+`timeoutMs` does **not** bound `onUpdate` itself for the final (`success`/
+`fail`) call — by the time the task reaches a terminal state, the SDK already
+has the real result in hand, and there's no safe way to give up on an
+in-flight `onUpdate` call without either hanging anyway or silently
+discarding whatever it was doing (e.g. persisting the result). It's awaited
+to completion instead. If your `onUpdate` does work that could itself hang,
+bound it with `signal`:
+
+```js
+const task = await client.tasks.run({
+  model: "seedance-2-0",
+  input: { prompt: "..." },
+  signal: AbortSignal.timeout(120_000), // also bounds a hanging onUpdate
+  onUpdate: async (t) => {
+    await saveTaskState(t); // if this hangs, `signal` is what stops the wait
+  },
+});
+```
+
+Aborting stops `wait()`/`run()` from waiting any further — it does **not**
+cancel the remote task, or any `onUpdate` call already in progress.
+
 Output URLs are **temporary** — they expire about 7 days after creation (each
 output carries `expireAt`). To keep an output long-term, pass
 `storage: "persistent"` to `create()`/`run()` (billed by size; insufficient

@@ -126,6 +126,13 @@ export type RunParams = CreateTaskParams & WaitOptions;
 export interface ListParams {
   page?: number;
   size?: number;
+  /**
+   * Aborts this request (including any pending retry-backoff sleep). Unlike
+   * `create()`, a GET has no billing/idempotency ambiguity to worry about,
+   * so there's no reason to leave it uncancellable the way `create()`
+   * deliberately is.
+   */
+  signal?: AbortSignal;
 }
 
 export class Tasks {
@@ -221,7 +228,10 @@ export class Tasks {
   async list(params: ListParams = {}): Promise<TaskPage> {
     const page = params.page ?? 1;
     const size = params.size ?? 20;
-    const env = await this.transport.request("GET", "/tasks", { params: { page, size } });
+    const env = await this.transport.request("GET", "/tasks", {
+      params: { page, size },
+      signal: params.signal,
+    });
     const rawData = env.data;
     let d: JSONObject;
     if (Array.isArray(rawData)) {

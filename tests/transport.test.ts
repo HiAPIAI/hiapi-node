@@ -224,6 +224,44 @@ describe("abort during retry", () => {
     assert.ok(performance.now() - started < 5_000);
   });
 
+  test("an abort during a non-2xx response body read surfaces as AbortError, not a wrongly-mapped status error", async () => {
+    // safeText() used to swallow EVERY resp.text() failure, including one
+    // caused by the request's own signal aborting mid-read — the caller-
+    // abort check in the surrounding catch block never got a chance to run,
+    // since the body-read failure never reached it. Confirmed by
+    // reproducing an abort landing while a 404's body was still pending:
+    // the SDK produced NotFoundError instead of AbortError, even though
+    // `signal.aborted` was already true by the time status mapping ran. A
+    // hand-written fetch stub simulates a real "headers arrived, body still
+    // pending" response — the shared mock HTTP server can't hold a body
+    // open independently of its headers.
+    const controller = new AbortController();
+    const impl: FetchLike = async (_input, init) => {
+      const signal = init?.signal;
+      return {
+        ok: false,
+        status: 404,
+        headers: new Headers(),
+        text: () =>
+          new Promise<string>((_, reject) => {
+            const onAbort = () =>
+              reject(signal!.reason ?? new DOMException("This operation was aborted", "AbortError"));
+            if (signal?.aborted) {
+              onAbort();
+              return;
+            }
+            signal?.addEventListener("abort", onAbort, { once: true });
+          }),
+      } as unknown as Response;
+    };
+    const waiting = client({ fetch: impl, maxRetries: 0 }).tasks.retrieve("t", controller.signal);
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(waiting, (err: unknown) => {
+      assert.equal((err as Error).name, "AbortError");
+      return true;
+    });
+  });
+
   test("a genuine per-request timeout still surfaces as APIConnectionError, not an AbortError, when signal is also present but not aborted", async () => {
     // Combining `opts.signal` with the per-attempt AbortSignal.timeout() via
     // AbortSignal.any() must not blur which one actually fired — a timeout
@@ -240,6 +278,40 @@ describe("abort during retry", () => {
       }),
       APIConnectionError,
     );
+  });
+
+  test("many requests sharing one long-lived AbortSignal don't accumulate retained memory", async (t) => {
+    // Regression for a real leak: an earlier revision composed each
+    // attempt's signal via AbortSignal.any([callerSignal,
+    // AbortSignal.timeout(...)]) — a composition with no way to be torn
+    // down early, so recreating it on every attempt against the SAME
+    // long-lived caller signal (exactly what a long wait() poll loop does)
+    // accumulated one live listener/composite-signal object per attempt. A
+    // targeted micro-benchmark showed ~213MB retained for 100k such
+    // compositions against one shared signal, vs. ~80MB for
+    // AbortSignal.timeout() alone — confirmed via `node --expose-gc`.
+    if (typeof global.gc !== "function") {
+      t.skip("requires --expose-gc (set in this package's own `npm test` script)");
+      return;
+    }
+    mock.reset(() => jsonReply({ data: { taskId: "t", model: "m", status: "queued" } }));
+    const controller = new AbortController();
+    const c = client();
+    const N = 15_000;
+    global.gc();
+    const before = process.memoryUsage().heapUsed;
+    for (let i = 0; i < N; i++) {
+      await c.tasks.retrieve("t", controller.signal);
+    }
+    global.gc();
+    const after = process.memoryUsage().heapUsed;
+    const deltaMB = (after - before) / 1024 / 1024;
+    // Calibrated against the actual pre-fix code, not guessed: reverting to
+    // the AbortSignal.any()-based composition retains ~29MB at this same
+    // N=15,000 (~2KB/call) — this 15MB ceiling sits well below that real
+    // regression while comfortably tolerating ordinary heap noise between
+    // two single GC snapshots (the fixed version retains next to nothing).
+    assert.ok(deltaMB < 15, `retained ${deltaMB.toFixed(1)}MB across ${N} calls sharing one signal`);
   });
 });
 

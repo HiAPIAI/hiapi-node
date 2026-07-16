@@ -51,7 +51,7 @@
     "build:esm": "tsc -p tsconfig.esm.json",
     "build:cjs": "tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type: 'commonjs'}) + '\\n')\"",
     "pretest": "tsc -p tsconfig.test.json",
-    "test": "cd build-test/tests && node --test && cd ../.. && npm run smoke",
+    "test": "cd build-test/tests && node --expose-gc --test && cd ../.. && npm run smoke",
     "smoke": "npm run build && node scripts/smoke-esm.mjs && node scripts/smoke-cjs.cjs && node scripts/smoke-types.mjs",
     "prepack": "npm run build"
   },

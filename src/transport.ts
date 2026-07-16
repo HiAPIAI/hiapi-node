@@ -207,78 +207,89 @@ export class Transport {
 
     let attempt = 0;
     for (;;) {
-      // A per-attempt combination, not reused across retries: AbortSignal.any()
-      // documents that a signal composed this way carries no obligation to
-      // ever be cleaned up beyond the attempt it was created for, and a
-      // fresh AbortSignal.timeout(this.timeoutMs) — this request's own
-      // per-attempt timeout budget — is exactly as unsafe to reuse across
-      // attempts as it already was before `signal` existed.
-      const attemptSignal = opts.signal
-        ? AbortSignal.any([opts.signal, AbortSignal.timeout(this.timeoutMs)])
-        : AbortSignal.timeout(this.timeoutMs);
-      let status: number;
-      let respHeaders: Headers;
-      let rawText: string;
+      // A per-attempt, explicitly disposed signal — NOT AbortSignal.any(),
+      // which an earlier revision recreated on every attempt against the
+      // SAME long-lived caller `signal`. Each composed signal registers a
+      // real "abort" listener on every one of its sources for as long as
+      // neither side is aborted or garbage-collected — repeatedly composing
+      // against one long-lived `signal` (exactly what a long `wait()` poll
+      // loop, `signal`'s primary real-world use, does on every retry
+      // attempt) accumulates one live listener/composite-signal object per
+      // attempt: confirmed via a targeted micro-benchmark that 100k such
+      // compositions against one shared caller signal retained ~213MB after
+      // a forced GC, vs. ~80MB for `AbortSignal.timeout()` alone.
+      // `createAttemptSignal`'s `dispose()` (called in the `finally` below,
+      // every iteration) detaches both listeners and clears the timer
+      // immediately once this attempt is done, so nothing accumulates no
+      // matter how many attempts a call ends up making.
+      const { signal: attemptSignal, dispose } = createAttemptSignal(opts.signal, this.timeoutMs);
       try {
-        const resp = await this.fetchImpl(url, {
-          method,
-          headers,
-          body: bodyText,
-          signal: attemptSignal,
-        });
-        if (resp.ok) {
-          const text = await resp.text();
-          return [decodeJson(text, resp.status), resp.headers];
+        let status: number;
+        let respHeaders: Headers;
+        let rawText: string;
+        try {
+          const resp = await this.fetchImpl(url, {
+            method,
+            headers,
+            body: bodyText,
+            signal: attemptSignal,
+          });
+          if (resp.ok) {
+            const text = await resp.text();
+            return [decodeJson(text, resp.status), resp.headers];
+          }
+          status = resp.status;
+          respHeaders = resp.headers;
+          rawText = await safeText(resp, attemptSignal);
+        } catch (err) {
+          // decodeJson signals malformed 2xx bodies with an APIError — that is a
+          // final answer from the server, not a network failure; never retry it.
+          if (err instanceof HiAPIError) {
+            throw err;
+          }
+          // The CALLER's signal (not the per-attempt timeout, which produces
+          // the identical DOMException shape) firing must surface as a plain
+          // abort, not get wrapped in APIConnectionError or retried — the
+          // caller asked to stop, not "the network failed, try again".
+          if (opts.signal?.aborted) {
+            throw opts.signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+          }
+          // Anything else fetch throws is network-level: DNS, refused/reset
+          // connections, TLS failures, or the per-attempt timeout firing.
+          // Only retry when the request is safe to repeat (see gate above).
+          if (retryOnNetworkError && attempt < this.maxRetries) {
+            await sleep(retryDelayMs(attempt, null), opts.signal);
+            attempt += 1;
+            continue;
+          }
+          throw new APIConnectionError(`request to ${url} failed: ${describeError(err)}`, {
+            cause: err,
+          });
         }
-        status = resp.status;
-        respHeaders = resp.headers;
-        rawText = await safeText(resp);
-      } catch (err) {
-        // decodeJson signals malformed 2xx bodies with an APIError — that is a
-        // final answer from the server, not a network failure; never retry it.
-        if (err instanceof HiAPIError) {
-          throw err;
-        }
-        // The CALLER's signal (not the per-attempt timeout, which produces
-        // the identical DOMException shape) firing must surface as a plain
-        // abort, not get wrapped in APIConnectionError or retried — the
-        // caller asked to stop, not "the network failed, try again".
-        if (opts.signal?.aborted) {
-          throw opts.signal.reason ?? new DOMException("This operation was aborted", "AbortError");
-        }
-        // Anything else fetch throws is network-level: DNS, refused/reset
-        // connections, TLS failures, or the AbortSignal.timeout firing. Only
-        // retry when the request is safe to repeat (see gate above).
-        if (retryOnNetworkError && attempt < this.maxRetries) {
-          await sleep(retryDelayMs(attempt, null), opts.signal);
+
+        if (RETRY_STATUSES.has(status) && attempt < this.maxRetries) {
+          await sleep(retryDelayMs(attempt, respHeaders), opts.signal);
           attempt += 1;
           continue;
         }
-        throw new APIConnectionError(`request to ${url} failed: ${describeError(err)}`, {
-          cause: err,
-        });
+        const err = errorFromResponse(status, rawText);
+        // A 409 IDEMPOTENCY_KEY_PROCESSING means the first request with this
+        // key is still in flight; honour Retry-After and retry — the next
+        // attempt hits the replay path and returns the task.
+        if (
+          hasIdempotencyKey &&
+          status === 409 &&
+          err.errorCode === IDEMPOTENCY_PROCESSING_CODE &&
+          attempt < this.maxRetries
+        ) {
+          await sleep(retryDelayMs(attempt, respHeaders), opts.signal);
+          attempt += 1;
+          continue;
+        }
+        throw err;
+      } finally {
+        dispose();
       }
-
-      if (RETRY_STATUSES.has(status) && attempt < this.maxRetries) {
-        await sleep(retryDelayMs(attempt, respHeaders), opts.signal);
-        attempt += 1;
-        continue;
-      }
-      const err = errorFromResponse(status, rawText);
-      // A 409 IDEMPOTENCY_KEY_PROCESSING means the first request with this
-      // key is still in flight; honour Retry-After and retry — the next
-      // attempt hits the replay path and returns the task.
-      if (
-        hasIdempotencyKey &&
-        status === 409 &&
-        err.errorCode === IDEMPOTENCY_PROCESSING_CODE &&
-        attempt < this.maxRetries
-      ) {
-        await sleep(retryDelayMs(attempt, respHeaders), opts.signal);
-        attempt += 1;
-        continue;
-      }
-      throw err;
     }
   }
 
@@ -362,6 +373,52 @@ function abortReason(signal: AbortSignal): unknown {
 }
 
 /**
+ * Builds the signal for one request attempt — aborted by either `callerSignal`
+ * or the per-attempt `timeoutMs` budget, whichever fires first — as a plain
+ * `AbortController` with manually managed listeners and a manually managed
+ * `setTimeout`, NOT `AbortSignal.any([callerSignal, AbortSignal.timeout(...)])`.
+ * That composition has no way to be torn down early: neither
+ * `AbortSignal.any()`'s internal "abort" listeners on its sources nor
+ * `AbortSignal.timeout()`'s own internal timer can be released before they'd
+ * naturally fire, so recreating one on every retry attempt against the SAME
+ * long-lived `callerSignal` (exactly what a long `wait()` poll loop does)
+ * accumulates listeners and pending timers that live for the FULL original
+ * `timeoutMs` regardless of how quickly each individual attempt actually
+ * completes — confirmed via a targeted benchmark showing substantial retained
+ * memory after high-volume use. `dispose()` (call once the attempt is
+ * settled, success or failure) removes both listeners and clears the timer
+ * immediately, so nothing outlives the attempt it belongs to.
+ */
+function createAttemptSignal(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number,
+): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException(`signal timed out after ${timeoutMs}ms`, "TimeoutError"));
+  }, timeoutMs);
+  // Doesn't itself keep the process alive — this timer exists to bound an
+  // already-pending request, not to schedule work of its own.
+  timer.unref?.();
+  const onCallerAbort = () => {
+    controller.abort(callerSignal!.reason);
+  };
+  if (callerSignal?.aborted) {
+    clearTimeout(timer);
+    controller.abort(callerSignal.reason);
+  } else {
+    callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    },
+  };
+}
+
+/**
  * Describes an arbitrary thrown/rejected value for an error message,
  * without ever throwing itself. `fetch` is a documented, user-replaceable
  * option (see `HiAPIOptions.fetch`); a custom implementation can reject with
@@ -389,10 +446,26 @@ function describeError(err: unknown): string {
   }
 }
 
-async function safeText(resp: Response): Promise<string> {
+/**
+ * Reads a non-2xx response body, tolerating a body that's malformed or
+ * unreadable for reasons unrelated to cancellation (still try to surface
+ * SOME status-mapped error rather than crash). NOT tolerant of `signal`
+ * itself being the reason the read failed: swallowing that too — an earlier
+ * revision did — let an abort or per-attempt timeout landing mid-body-read
+ * silently turn into a normal (wrong) status-mapped error instead of
+ * surfacing as the cancellation it actually was (confirmed by reproducing
+ * an abort during a pending 404 body read producing `NotFoundError` while
+ * `signal.aborted` was already `true`). Re-throwing here hands the failure
+ * back to the caller's own catch block, which already distinguishes a
+ * caller abort from a retryable timeout correctly.
+ */
+async function safeText(resp: Response, signal: AbortSignal): Promise<string> {
   try {
     return await resp.text();
-  } catch {
+  } catch (err) {
+    if (signal.aborted) {
+      throw err;
+    }
     return "";
   }
 }

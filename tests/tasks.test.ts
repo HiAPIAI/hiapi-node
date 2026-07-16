@@ -301,6 +301,19 @@ describe("tasks.list", () => {
     assert.deepEqual(page.items, []);
     assert.deepEqual(page.raw, { payload: { tasks: [{ taskId: "z" }] }, traceId: "trace-2" });
   });
+
+  test("signal aborts a pending list() request — unlike create(), a GET has no billing ambiguity to justify being uncancellable", async () => {
+    mock.reset(() => new Promise(() => {}));
+    const controller = new AbortController();
+    const started = performance.now();
+    const waiting = client().tasks.list({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(waiting, (err: unknown) => {
+      assert.equal((err as Error).name, "AbortError");
+      return true;
+    });
+    assert.ok(performance.now() - started < 5_000);
+  });
 });
 
 describe("tasks.wait", () => {
