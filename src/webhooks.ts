@@ -120,6 +120,18 @@ export function verifyWebhook(body: string | Uint8Array, opts: VerifyWebhookOpti
   if (!task.taskId.trim()) {
     throw new WebhookVerificationError("verified payload did not include a taskId");
   }
+  // Same reasoning as taskId above, applied to `status`: a missing/blank one
+  // parses to `""` (kept as a plain string, not the `TaskStatus` union, so a
+  // real future status still parses) rather than failing outright — but an
+  // empty string isn't a forward-compatible unknown status, it's the field
+  // being absent. Per this SDK's own README, a typical handler upserts on
+  // taskId and returns 2xx to stop redelivery; a signed-but-statusless
+  // callback would otherwise be accepted as if it were a genuine (if
+  // unrecognized) status, permanently acknowledging a notification whose
+  // actual success/fail outcome was never received.
+  if (!task.status.trim()) {
+    throw new WebhookVerificationError("verified payload did not include a status");
+  }
   return task;
 }
 

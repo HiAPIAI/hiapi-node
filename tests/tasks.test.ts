@@ -93,9 +93,22 @@ describe("tasks.create", () => {
     assert.equal(mock.requests[0].headers["idempotency-key"], "abc-123");
   });
 
-  test("a whitespace-only idempotencyKey is treated as absent, not sent as a header", async () => {
+  test("a whitespace-only idempotencyKey is rejected, not silently downgraded to a keyless request", async () => {
+    // A non-empty-as-authored value that trims down to nothing (unlike an
+    // exactly-empty string, which does mean "absent") most likely comes
+    // from a bug in dynamically-derived key-generation logic — silently
+    // sending the request without a key would leave the caller believing
+    // idempotency protection was active when it wasn't.
+    await assert.rejects(
+      client().tasks.create({ model: "m", input: {}, idempotencyKey: "   " }),
+      RangeError,
+    );
+    assert.equal(mock.requests.length, 0);
+  });
+
+  test("an exactly-empty idempotencyKey is treated as absent, not sent as a header", async () => {
     mock.reset(() => jsonReply({ data: { taskId: "t" } }));
-    await client().tasks.create({ model: "m", input: {}, idempotencyKey: "   " });
+    await client().tasks.create({ model: "m", input: {}, idempotencyKey: "" });
     assert.equal(mock.requests[0].headers["idempotency-key"], undefined);
   });
 
@@ -184,6 +197,27 @@ describe("tasks.retrieve", () => {
       assert.match(err.message, /wrong-task.*does not match.*t9/);
       return true;
     });
+  });
+
+  test("rejects a response with a matching taskId but no (or blank) status", async () => {
+    // A missing/non-string status parses to "" (kept as a plain string for
+    // forward compatibility with future statuses) — but an empty one isn't
+    // a forward-compatible unknown value, it's the field being absent
+    // entirely. Without this check, {data:{taskId:"t"}} would be accepted
+    // as a legitimate, non-terminal task and wait() would poll it forever
+    // (or time out) instead of surfacing the real protocol problem.
+    for (const malformed of [{ taskId: "t" }, { taskId: "t", status: "" }, { taskId: "t", status: "   " }]) {
+      mock.reset(() => jsonReply({ data: malformed }));
+      await assert.rejects(
+        client().tasks.retrieve("t"),
+        (err: unknown) => {
+          assert.ok(err instanceof HiAPIError);
+          assert.match(err.message, /did not include a status/);
+          return true;
+        },
+        `malformed=${JSON.stringify(malformed)}`,
+      );
+    }
   });
 });
 
@@ -332,6 +366,51 @@ describe("tasks.wait", () => {
       PollTimeoutError,
     );
     assert.ok(performance.now() - started < 5_000);
+  });
+
+  test("a terminal-status onUpdate slower than the deadline still returns the real result, not a false PollTimeoutError", async () => {
+    // A round-8 regression: raceOnUpdate raced EVERY onUpdate call against
+    // the polling deadline, including the terminal one — but retrieve()
+    // above already has the real answer (success/fail) in hand at that
+    // point, so a merely-slow callback racing past the deadline must never
+    // discard a task that has already finished. Reproduced with a "success"
+    // response and an onUpdate slower than timeoutMs: the buggy version
+    // threw PollTimeoutError here instead of returning the task.
+    mock.reset(() => statusReply("success"));
+    const task = await client().tasks.wait("w1", {
+      pollIntervalMs: 5,
+      timeoutMs: 10,
+      onUpdate: () => new Promise<void>((resolve) => setTimeout(resolve, 30)),
+    });
+    assert.equal(task.status, "success");
+  });
+
+  test("a terminal-status onUpdate slower than the deadline still throws the real TaskFailedError, not a false PollTimeoutError", async () => {
+    mock.reset(() => statusReply("fail", { error: { code: "X", message: "boom" } }));
+    await assert.rejects(
+      client().tasks.wait("w1", {
+        pollIntervalMs: 5,
+        timeoutMs: 10,
+        onUpdate: () => new Promise<void>((resolve) => setTimeout(resolve, 30)),
+      }),
+      TaskFailedError,
+    );
+  });
+
+  test("a timeoutMs beyond Node's single-timer limit doesn't crash or misfire when onUpdate resolves normally", async () => {
+    // Doesn't (and practically can't, without waiting weeks or faking
+    // performance.now(), which node:test's MockTimers doesn't support)
+    // prove the exact re-arming behavior at the ~24.85-day boundary — but
+    // it does confirm the large-timeoutMs code path (Math.min-clamped timer
+    // scheduling) doesn't itself throw or misbehave for the common case.
+    mock.reset(() => statusReply("success"));
+    const farBeyondSingleTimer = 30 * 24 * 60 * 60 * 1000; // 30 days > MAX_TIMER_DELAY_MS (~24.85 days)
+    const task = await client().tasks.wait("w1", {
+      pollIntervalMs: 1,
+      timeoutMs: farBeyondSingleTimer,
+      onUpdate: () => Promise.resolve(),
+    });
+    assert.equal(task.status, "success");
   });
 
   test("an AbortSignal fired during a hanging onUpdate is honoured promptly, not blocked until it settles", async () => {
@@ -656,6 +735,26 @@ describe("tasks.run", () => {
     );
   });
 
+  test("RunFailedError's own constructor never throws, even given a cause with a throwing toString()", () => {
+    // `String(cause)` (or a template literal, which does the same ToString
+    // conversion) calls a non-Error cause's own toString()/Symbol.toPrimitive
+    // — confirmed via `node -e` that a plain object with a throwing
+    // toString() makes String(...) itself throw. Since that used to run
+    // directly inside this constructor, constructing RunFailedError for
+    // exactly this kind of rejection reason threw a completely different,
+    // cause-less, taskId-less error instead — defeating the whole point of
+    // this type for an already-created, possibly-billing task.
+    const throwingCause = {
+      toString() {
+        throw new Error("toString boom");
+      },
+    };
+    const err = new RunFailedError("t1", throwingCause);
+    assert.equal(err.taskId, "t1");
+    assert.equal(err.cause, throwingCause);
+    assert.match(err.message, /t1/);
+  });
+
   test("TaskFailedError and PollTimeoutError from wait() are NOT wrapped — they already carry the taskId", async () => {
     mock.reset((_req, index) =>
       index === 0
@@ -681,6 +780,36 @@ describe("tasks.run", () => {
       (err: unknown) => {
         assert.ok(err instanceof PollTimeoutError);
         assert.equal(err.taskId, "r6");
+        return true;
+      },
+    );
+  });
+
+  test("a PollTimeoutError for a DIFFERENT task from inside onUpdate is wrapped in RunFailedError, not passed through with the wrong taskId", async () => {
+    // onUpdate is arbitrary caller code and could itself call back into this
+    // SDK for an unrelated task (e.g. its own nested wait()) — that call's
+    // PollTimeoutError must not leak past run() as if it were about
+    // `created.taskId`, or the caller ends up trying to recover the wrong
+    // task entirely.
+    mock.reset((_req, index) =>
+      index === 0
+        ? jsonReply({ data: { taskId: "real" } })
+        : jsonReply({ data: { taskId: "real", model: "m", status: "queued" } }),
+    );
+    const otherTasksError = new PollTimeoutError("other-task", 123);
+    await assert.rejects(
+      client().tasks.run({
+        model: "m",
+        input: {},
+        pollIntervalMs: 1,
+        onUpdate: () => {
+          throw otherTasksError;
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RunFailedError);
+        assert.equal(err.taskId, "real");
+        assert.equal(err.cause, otherTasksError);
         return true;
       },
     );

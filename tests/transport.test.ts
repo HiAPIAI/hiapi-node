@@ -115,7 +115,7 @@ describe("HTTP status retries (429/503)", () => {
     mock.reset((_req, index) =>
       index === 0
         ? jsonReply({ message: "slow down" }, 429, { "Retry-After": "0" })
-        : jsonReply({ data: { taskId: "t-ok" } }),
+        : jsonReply({ data: { taskId: "t-ok", model: "m", status: "queued" } }),
     );
     const task = await client().tasks.retrieve("t-ok");
     assert.equal(task.taskId, "t-ok");
@@ -136,7 +136,7 @@ describe("HTTP status retries (429/503)", () => {
     mock.reset((_req, index) =>
       index === 0
         ? jsonReply({ message: "unavailable" }, 503, { "Retry-After": "0" })
-        : jsonReply({ data: { taskId: "up" } }),
+        : jsonReply({ data: { taskId: "up", model: "m", status: "queued" } }),
     );
     const task = await client().tasks.retrieve("up");
     assert.equal(task.taskId, "up");
@@ -171,7 +171,7 @@ describe("HTTP status retries (429/503)", () => {
     mock.reset((_req, index) =>
       index === 0
         ? jsonReply({ message: "slow down" }, 429, { "Retry-After": future })
-        : jsonReply({ data: { taskId: "t-date" } }),
+        : jsonReply({ data: { taskId: "t-date", model: "m", status: "queued" } }),
     );
     const started = performance.now();
     const task = await client().tasks.retrieve("t-date");

@@ -182,6 +182,18 @@ export class Tasks {
         `task detail response taskId "${task.taskId}" does not match the requested "${taskId}"`,
       );
     }
+    // A missing/non-string `status` parses to `""` (see `Task.fromJSON`) —
+    // deliberately kept as a plain string, not the `TaskStatus` union,
+    // precisely so a future *real* status the server adds still parses
+    // instead of breaking an older SDK. An empty one is different: it's not
+    // a forward-compatible unknown value, it's the field being absent
+    // entirely. Without this check, `{data:{taskId:"t"}}` parses as a
+    // "successfully retrieved", non-terminal task — `wait()` would keep
+    // polling it forever (or time out) instead of surfacing the real
+    // problem: a malformed response.
+    if (!task.status.trim()) {
+      throw new HiAPIError(`task ${taskId} detail response did not include a status`);
+    }
     return task;
   }
 
@@ -247,7 +259,23 @@ export class Tasks {
       options.signal?.throwIfAborted();
       if (options.onUpdate && task.status !== lastStatus) {
         lastStatus = task.status;
-        await raceOnUpdate(options.onUpdate(task), options.signal, taskId, timeoutMs, deadline);
+        // The polling `deadline` must NOT apply to a *terminal* status's
+        // onUpdate call: `retrieve()` above already has the real answer
+        // (success/fail) in hand, so a merely-slow callback racing past the
+        // deadline must never turn a task that has already finished into a
+        // false PollTimeoutError — confirmed by reproducing exactly that
+        // (a "success" response with a callback slower than the timeout
+        // threw PollTimeoutError instead of returning the task). Passed
+        // `Infinity` here reuses raceOnUpdate's existing "no deadline"
+        // branch; `signal` is still raced either way — an explicit abort is
+        // a request to stop caring about this task, terminal or not.
+        await raceOnUpdate(
+          options.onUpdate(task),
+          options.signal,
+          taskId,
+          timeoutMs,
+          task.isTerminal ? Infinity : deadline,
+        );
         // Re-checked once more: onUpdate settling normally doesn't itself
         // prove the signal wasn't aborted in the same tick it resolved —
         // without this, an abort landing right as a terminal-status
@@ -290,9 +318,9 @@ export class Tasks {
    * other way `run()` can fail (an abort landing later, a network/API error
    * while polling, an `onUpdate` rejection) is wrapped in
    * {@link RunFailedError} so the `taskId` is never lost — except
-   * `TaskFailedError` and `PollTimeoutError`, which already carry it and are
-   * re-thrown unchanged. See {@link RunAbortedError} for the immediate
-   * post-creation case.
+   * `TaskFailedError` and `PollTimeoutError` **for this same task**, which
+   * already carry it and are re-thrown unchanged. See {@link RunAbortedError}
+   * for the immediate post-creation case.
    */
   async run(params: RunParams): Promise<Task> {
     params.signal?.throwIfAborted();
@@ -312,7 +340,17 @@ export class Tasks {
         signal: params.signal,
       });
     } catch (err) {
-      if (err instanceof TaskFailedError || err instanceof PollTimeoutError) {
+      // Matched by taskId, not just `instanceof` — an `onUpdate` is
+      // arbitrary caller code and could itself call into this SDK for a
+      // DIFFERENT task (e.g. its own nested `wait()`); that call's
+      // TaskFailedError/PollTimeoutError would otherwise pass straight
+      // through `run()` unwrapped, handing the caller a task id that isn't
+      // `created.taskId` at all — confirmed by reproducing exactly that
+      // with an onUpdate throwing `PollTimeoutError("other-task", ...)`.
+      if (
+        (err instanceof TaskFailedError && err.task.taskId === created.taskId) ||
+        (err instanceof PollTimeoutError && err.taskId === created.taskId)
+      ) {
         throw err;
       }
       throw new RunFailedError(created.taskId, err);
@@ -406,12 +444,28 @@ function raceOnUpdate(
       reject(signal!.reason ?? new DOMException("This operation was aborted", "AbortError"));
     };
     if (Number.isFinite(deadline)) {
-      const remainingMs = Math.max(0, Math.min(deadline - performance.now(), MAX_TIMER_DELAY_MS));
-      timer = setTimeout(() => {
-        if (settled) return;
-        cleanup();
-        reject(new PollTimeoutError(taskId, timeoutMs));
-      }, remainingMs);
+      // A single `setTimeout` can't span more than Node's real (signed
+      // 32-bit) timer limit (`MAX_TIMER_DELAY_MS`, ~24.85 days) — clamping
+      // just the FIRST segment's duration and treating its firing as "the
+      // deadline passed" would reject with PollTimeoutError up to ~24.85
+      // days early for any `timeoutMs` beyond that (an explicitly supported
+      // value — `wait()` allows `timeoutMs: Infinity`, and any long-running
+      // `timeoutMs` in between): confirmed by tracing a 30-day `timeoutMs`
+      // through the earlier single-`setTimeout` version. Re-arming against
+      // the true remaining time on each firing — instead of one clamped
+      // `setTimeout` — makes an arbitrarily long `timeoutMs` wait out its
+      // full, correct duration.
+      const armTimer = () => {
+        const remainingMs = deadline - performance.now();
+        if (remainingMs <= 0) {
+          if (settled) return;
+          cleanup();
+          reject(new PollTimeoutError(taskId, timeoutMs));
+          return;
+        }
+        timer = setTimeout(armTimer, Math.min(remainingMs, MAX_TIMER_DELAY_MS));
+      };
+      armTimer();
     }
     signal?.addEventListener("abort", onAbort, { once: true });
     settledResult.then(

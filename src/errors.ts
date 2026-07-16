@@ -237,14 +237,36 @@ export class RunFailedError extends HiAPIError {
   readonly taskId: string;
 
   constructor(taskId: string, cause: unknown) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
     super(
-      `run() failed for task ${taskId} after it was created: ${reason} — it ` +
+      `run() failed for task ${taskId} after it was created: ${describeCause(cause)} — it ` +
         `may still run and bill; poll tasks.retrieve("${taskId}") to check on it`,
       { cause },
     );
     this.name = "RunFailedError";
     this.taskId = taskId;
+  }
+}
+
+/**
+ * Describes an arbitrary rejection reason for an error message, without ever
+ * throwing itself. A plain `String(cause)` (or a template literal, which
+ * does the same ToString conversion) calls `cause`'s own `toString`/
+ * `Symbol.toPrimitive` for a non-`Error` object — confirmed via `node -e`
+ * that a plain object with a throwing `toString()` makes `String(...)`
+ * itself throw. Since this runs inside {@link RunFailedError}'s constructor,
+ * that would make constructing the error throw a completely different,
+ * `cause`-less, `taskId`-less error instead — defeating the entire point of
+ * carrying `cause` and `taskId` for an already-created, possibly-billing
+ * task.
+ */
+function describeCause(cause: unknown): string {
+  if (cause instanceof Error) {
+    return cause.message;
+  }
+  try {
+    return String(cause);
+  } catch {
+    return `<un-stringifiable ${typeof cause}>`;
   }
 }
 

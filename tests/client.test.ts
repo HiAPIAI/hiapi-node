@@ -63,13 +63,18 @@ describe("client construction", () => {
     for (const timeoutMs of [NaN, Infinity, -1, 0, 0.5, 3_000_000_000]) {
       assert.throws(() => new HiAPI({ apiKey: "sk-test", timeoutMs }), RangeError, `timeoutMs=${timeoutMs}`);
     }
-    for (const maxRetries of [NaN, Infinity]) {
+    // 1e9 and Number.MAX_VALUE both pass Number.isFinite yet would retry a
+    // persistent 429/503/network failure for an effectively-unbounded
+    // duration (on the order of centuries at the ~8s backoff cap) —
+    // confirmed by tracing the retry loop's own bound (attempt < maxRetries).
+    for (const maxRetries of [NaN, Infinity, 1_000_000_000, Number.MAX_VALUE]) {
       assert.throws(() => new HiAPI({ apiKey: "sk-test", maxRetries }), RangeError, `maxRetries=${maxRetries}`);
     }
-    // Sanity: valid values, including the exact (signed 32-bit) upper bound,
-    // still construct fine.
+    // Sanity: valid values, including the exact (signed 32-bit) timeoutMs
+    // upper bound and the maxRetries cap itself, still construct fine.
     assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", timeoutMs: 1000, maxRetries: 0 }));
     assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", timeoutMs: 2_147_483_647 }));
+    assert.doesNotThrow(() => new HiAPI({ apiKey: "sk-test", maxRetries: 1000 }));
   });
 
   test("a custom fetch implementation is used for requests", async () => {

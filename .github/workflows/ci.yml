@@ -7,9 +7,15 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Windows is not just an extra target: scripts/smoke-types.mjs has
+    # Windows-specific code (resolving npm's own CLI relative to the node
+    # install layout, with a cmd.exe fallback) that ubuntu-latest alone can
+    # never actually exercise — a real bug there could pass every check here
+    # and still fail for a Windows user.
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest, windows-latest]
         node-version: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4

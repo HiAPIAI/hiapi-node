@@ -188,6 +188,22 @@ describe("verifyWebhook", () => {
       /did not include a taskId/,
     );
   });
+
+  test("rejects a validly-signed body that omits status", () => {
+    // Same reasoning as the missing-taskId case above: a signature only
+    // proves the sender knows the secret, not that the payload is
+    // well-formed. Per this SDK's own README, a typical handler upserts on
+    // taskId and returns 2xx to stop redelivery — a signed-but-statusless
+    // callback would otherwise be accepted as if it carried a real (if
+    // unrecognized) status, permanently acknowledging a notification whose
+    // actual success/fail outcome was never received.
+    const ts = String(nowSecs());
+    const noStatus = JSON.stringify({ taskId: "cb-2", model: "m" });
+    assert.throws(
+      () => verifyWebhook(noStatus, { signature: sign(noStatus, ts), timestamp: ts, secret: SECRET }),
+      /did not include a status/,
+    );
+  });
 });
 
 describe("Webhooks.verify header handling", () => {

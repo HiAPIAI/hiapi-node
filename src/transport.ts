@@ -33,6 +33,15 @@ export const IDEMPOTENCY_PROCESSING_CODE = "IDEMPOTENCY_KEY_PROCESSING";
 
 const MAX_BACKOFF_MS = 8_000;
 const MAX_RETRY_AFTER_MS = 60_000;
+// A merely-finite maxRetries (e.g. 1e9 or Number.MAX_VALUE — both pass
+// `Number.isFinite`) still lets a persistent 429/503/network failure retry
+// for an absurd, effectively-unbounded duration at the ~8s backoff cap
+// (confirmed: 1e9 retries is on the order of centuries). Neither the sibling
+// SDKs nor the wire protocol depend on this value — it's a purely local,
+// client-side retry-loop knob — so capping it here doesn't affect
+// cross-language contract parity, only how long a misconfigured client can
+// spin.
+const MAX_RETRIES_CAP = 1_000;
 // The largest delay Node's timers actually honour without clamping. NOT the
 // 4294967295 (2^32-1, unsigned 32-bit max) that AbortSignal.timeout()'s own
 // input validation allows through — that's a red herring: Node's underlying
@@ -83,8 +92,10 @@ export class Transport {
         `timeoutMs must be an integer in (0, ${MAX_TIMER_DELAY_MS}], got ${timeoutMs}`,
       );
     }
-    if (!Number.isFinite(maxRetries)) {
-      throw new RangeError(`maxRetries must be a finite number, got ${maxRetries}`);
+    if (!Number.isFinite(maxRetries) || maxRetries > MAX_RETRIES_CAP) {
+      throw new RangeError(
+        `maxRetries must be a finite number <= ${MAX_RETRIES_CAP}, got ${maxRetries}`,
+      );
     }
     this.apiKey = apiKey;
     this.baseUrl = normalizeBaseUrl(baseUrl);
@@ -138,10 +149,24 @@ export class Transport {
     // is `""` — silently treated as "no key" — and that
     // `" abc ".trim()` is `"abc"`, rewriting a caller's actual key
     // to a different, shorter one before validation ever saw the NBSP.
-    const idempotencyKey = opts.extraHeaders?.[IDEMPOTENCY_KEY_HEADER]?.replace(
-      /^[ \t]+|[ \t]+$/g,
-      "",
-    );
+    const rawIdempotencyKey = opts.extraHeaders?.[IDEMPOTENCY_KEY_HEADER];
+    const idempotencyKey = rawIdempotencyKey?.replace(/^[ \t]+|[ \t]+$/g, "");
+    // An explicitly-empty string ("", exactly as authored) means "no key",
+    // matching this SDK's established "'' ≡ absent" convention elsewhere
+    // (e.g. route) — callers already treat it the same as "not set" before
+    // it ever reaches here (see tasks.ts). A NON-empty value that trims down
+    // to nothing is different: it's not a deliberate "no key" signal, it's
+    // most likely a bug in dynamically-derived key-generation logic that
+    // LOOKS like it should enable idempotency protection but silently
+    // doesn't. Without this check, that config mistake sent the request
+    // anyway with no key at all: the caller would believe protection was
+    // active, and a retry after an ambiguous outcome (e.g. a client-side
+    // timeout) could double-bill with no warning.
+    if (rawIdempotencyKey !== undefined && rawIdempotencyKey !== "" && !idempotencyKey) {
+      throw new RangeError(
+        `idempotencyKey must not be entirely whitespace, got ${JSON.stringify(rawIdempotencyKey)}`,
+      );
+    }
     const hasIdempotencyKey = Boolean(idempotencyKey);
     if (idempotencyKey) {
       // Fetch header values are ByteString (Latin-1 only): a character
