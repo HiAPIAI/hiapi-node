@@ -174,6 +174,20 @@ describe("verifyWebhook", () => {
       /not a JSON object/,
     );
   });
+
+  test("rejects a validly-signed body that omits taskId", () => {
+    // A valid signature only proves the sender knows the secret, not that the
+    // payload is well-formed. Without this check a caller that dedupes by
+    // upserting on taskId (the pattern this SDK's own docs recommend) would
+    // silently collide every such malformed callback onto the same
+    // empty-string key.
+    const ts = String(nowSecs());
+    const noTaskId = JSON.stringify({ status: "success", model: "m" });
+    assert.throws(
+      () => verifyWebhook(noTaskId, { signature: sign(noTaskId, ts), timestamp: ts, secret: SECRET }),
+      /did not include a taskId/,
+    );
+  });
 });
 
 describe("Webhooks.verify header handling", () => {

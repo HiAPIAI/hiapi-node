@@ -6,6 +6,7 @@ import {
   APIError,
   AuthenticationError,
   HiAPI,
+  HiAPIError,
   IdempotencyKeyMismatchError,
   IdempotencyKeyProcessingError,
   InvalidRequestError,
@@ -45,6 +46,7 @@ function client(overrides: Partial<ConstructorParameters<typeof HiAPI>[0]> = {})
 
 describe("request framing", () => {
   test("sends auth, accept and user-agent headers; content-type only with a body", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "t1", model: "m", status: "queued" } }));
     await client().tasks.retrieve("t1");
     const get = mock.requests[0];
     assert.equal(get.headers.authorization, "Bearer sk-test");
@@ -60,7 +62,7 @@ describe("request framing", () => {
 
   test("normalizes the base URL so /v1 is always present exactly once", async () => {
     for (const suffix of ["", "/", "/v1", "/v1/"]) {
-      mock.reset(() => jsonReply({ data: {} }));
+      mock.reset(() => jsonReply({ data: { taskId: "t", model: "m", status: "queued" } }));
       await client({ baseUrl: mock.url + suffix }).tasks.retrieve("t");
       assert.equal(mock.requests[0].path, "/v1/tasks/t");
     }
@@ -78,10 +80,17 @@ describe("request framing", () => {
     assert.equal(mock.requests[0].path, "/v1/tasks?page=2&size=5");
   });
 
-  test("empty 2xx body parses as an empty envelope", async () => {
+  test("empty 2xx body decodes to an empty envelope without crashing, but retrieve() still rejects it", async () => {
+    // decodeJson itself must not throw on an empty body (it's valid to
+    // receive one, e.g. for future no-content responses) — but tasks.ts's
+    // own taskId-match check (not transport-level) correctly still refuses
+    // to hand back a Task that doesn't describe the task that was asked for.
     mock.reset(() => ({ status: 200, body: "" }));
-    const task = await client().tasks.retrieve("t");
-    assert.equal(task.taskId, "");
+    await assert.rejects(client().tasks.retrieve("t"), (err: unknown) => {
+      assert.ok(err instanceof HiAPIError);
+      assert.match(err.message, /does not match the requested/);
+      return true;
+    });
   });
 
   test("malformed 2xx JSON raises APIError, not a crash", async () => {
@@ -216,9 +225,10 @@ describe("network-error retry gates", () => {
   }
 
   test("GET is retried after a network error", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "t", model: "m", status: "queued" } }));
     const flaky = flakyFetch(1);
     const task = await client({ fetch: flaky.impl }).tasks.retrieve("t");
-    assert.equal(task.taskId, "");
+    assert.equal(task.taskId, "t");
     assert.equal(flaky.calls(), 2);
   });
 
@@ -370,5 +380,26 @@ describe("error mapping", () => {
   test("a recognized error_code wins over the status fallback", async () => {
     mock.reset(() => jsonReply({ error_code: "MODEL_UNAVAILABLE", message: "gone" }, 404));
     await assert.rejects(client().tasks.retrieve("t"), ModelUnavailableError);
+  });
+});
+
+describe("mock server error handling (test infra self-check)", () => {
+  // Regression test for _server.ts's try/catch + .catch() fix: a handler
+  // that throws (sync) or rejects (async) used to leave the connection open
+  // with no response, turning a test assertion thrown inside a handler into
+  // a confusing timeout instead of a clear failure. Both paths must now
+  // surface promptly as a connection error the client can see.
+  test("a handler that throws synchronously does not hang the connection", async () => {
+    mock.reset(() => {
+      throw new Error("boom-sync");
+    });
+    await assert.rejects(client({ maxRetries: 0 }).tasks.retrieve("t"), APIConnectionError);
+  });
+
+  test("a handler that returns a rejected promise does not hang the connection", async () => {
+    mock.reset(async () => {
+      throw new Error("boom-async");
+    });
+    await assert.rejects(client({ maxRetries: 0 }).tasks.retrieve("t"), APIConnectionError);
   });
 });

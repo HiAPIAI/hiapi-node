@@ -109,7 +109,18 @@ export function verifyWebhook(body: string | Uint8Array, opts: VerifyWebhookOpti
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
     throw new WebhookVerificationError("verified body is not a JSON object");
   }
-  return Task.fromJSON(payload as JSONObject);
+  const task = Task.fromJSON(payload as JSONObject);
+  // A valid signature only proves the sender knows the secret — it says
+  // nothing about the payload's SHAPE. A signed-but-malformed callback
+  // missing taskId would otherwise reach the caller's business logic; if
+  // that logic dedupes by upserting on taskId (the pattern this SDK's own
+  // docs recommend), every such malformed callback collides on the same
+  // empty-string key, silently dropping all but one — a real notification
+  // loss, not just a cosmetic gap.
+  if (!task.taskId.trim()) {
+    throw new WebhookVerificationError("verified payload did not include a taskId");
+  }
+  return task;
 }
 
 /**

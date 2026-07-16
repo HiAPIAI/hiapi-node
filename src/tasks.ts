@@ -120,8 +120,10 @@ export class Tasks {
     // silently produce a CreatedTask with taskId: "", and a subsequent
     // run()/wait() would poll `GET /tasks/` (empty id) — surfacing as a
     // confusing NotFoundError or PollTimeoutError instead of what actually
-    // went wrong: the server didn't return a task id.
-    if (!created.taskId) {
+    // went wrong: the server didn't return a task id. Trimmed, not a bare
+    // truthiness check — a whitespace-only id (e.g. "   ") is truthy but
+    // would produce the same nonsense request (`/tasks/%20%20%20`).
+    if (!created.taskId.trim()) {
       throw new HiAPIError(
         "task creation succeeded but the response did not include a taskId",
       );
@@ -132,7 +134,20 @@ export class Tasks {
   /** Fetch a task's current status and (when `success`) its output. */
   async retrieve(taskId: string): Promise<Task> {
     const env = await this.transport.request("GET", "/tasks/" + encodeURIComponent(taskId));
-    return Task.fromJSON(data(env));
+    const task = Task.fromJSON(data(env));
+    // A 2xx here is only trustworthy if it's actually describing the task we
+    // asked about — without this check, a malformed/mismatched response
+    // (missing taskId, or a caching/routing bug on the server returning a
+    // DIFFERENT task's data) would be silently accepted: wait() would either
+    // poll forever toward a timeout (status/output never matching what the
+    // caller expects) or, worse, misattribute another task's output as this
+    // one's. One comparison catches both the "empty" and "wrong" cases.
+    if (task.taskId !== taskId) {
+      throw new HiAPIError(
+        `task detail response taskId "${task.taskId}" does not match the requested "${taskId}"`,
+      );
+    }
+    return task;
   }
 
   /** List your tasks, newest first (paginated). */

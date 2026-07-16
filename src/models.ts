@@ -183,7 +183,16 @@ export class CreatedTask {
   }
 }
 
-/** One page of `GET /v1/tasks` (newest first). */
+/**
+ * One page of `GET /v1/tasks` (newest first).
+ *
+ * Parses defensively, matching the rest of this module: a missing, `null`,
+ * or unrecognized `data` shape becomes an empty page (`items: []`) rather
+ * than throwing — deliberately, so a server-side response shape you haven't
+ * seen yet never crashes an older SDK. This means an empty page can't be
+ * distinguished from a genuinely malformed response by `items.length` alone;
+ * `page.raw` always holds the full, unparsed envelope for that check.
+ */
 export class TaskPage {
   readonly items: Task[];
   readonly page?: number;

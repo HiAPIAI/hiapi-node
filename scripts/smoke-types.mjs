@@ -30,7 +30,17 @@ import { fileURLToPath } from "node:url";
 // `/C:/...`) that isn't a valid filesystem path — fileURLToPath() decodes
 // and normalizes correctly on every platform.
 const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const TSC = join(PACKAGE_ROOT, "node_modules/.bin/tsc");
+// tsc's own JS entry point, invoked via `node`, not the `.bin/tsc` shim —
+// avoids the Windows `.cmd`-shim problem without needing `shell: true` at
+// all (which — verified — has its OWN pitfall: execFileSync with an args
+// array and shell:true naively space-joins arguments into one command-line
+// string without shell-safe quoting, so a path containing a space, common on
+// Windows, would be split into two arguments instead of staying intact).
+const TSC_JS = join(PACKAGE_ROOT, "node_modules/typescript/lib/tsc.js");
+// `npm` itself has no local JS entry point to fall back on the same way; on
+// Windows it's genuinely only reachable as `npm.cmd`, so resolve the binary
+// name per-platform instead and call it directly with no shell involved.
+const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
 
 const CONSUMER_SOURCE = `
 import { HiAPI, type CreateTaskParams } from "hiapi";
@@ -58,15 +68,10 @@ async function run(): Promise<void> {
 void run();
 `;
 
-// `shell: true` on every call below: on Windows, locally-installed binaries
-// (npm, tsc) are `.cmd`/`.ps1` shims that `execFileSync` cannot run directly
-// without a shell (unlike POSIX, where the file itself is executable). Safe
-// here — every argument is a hardcoded constant, never untrusted input.
 const dir = mkdtempSync(join(tmpdir(), "hiapi-smoke-types-"));
 try {
-  const tarballName = execFileSync("npm", ["pack", "--silent", `--pack-destination=${dir}`], {
+  const tarballName = execFileSync(NPM, ["pack", "--silent", `--pack-destination=${dir}`], {
     cwd: PACKAGE_ROOT,
-    shell: true,
   })
     .toString()
     .trim();
@@ -80,48 +85,28 @@ try {
     join(dir, "package.json"),
     JSON.stringify({ name: "smoke-consumer", private: true, type: "module" }),
   );
-  execFileSync("npm", ["install", "--no-audit", "--no-fund", "--silent", tarballPath], {
-    cwd: dir,
-    shell: true,
-  });
+  execFileSync(NPM, ["install", "--no-audit", "--no-fund", "--silent", tarballPath], { cwd: dir });
+
+  const tscArgs = [
+    TSC_JS,
+    "--noEmit",
+    "--strict",
+    "--skipLibCheck",
+    "--module",
+    "nodenext",
+    "--moduleResolution",
+    "nodenext",
+    "--target",
+    "es2022",
+  ];
 
   // (a) "import" + "types" condition, under an ESM-boundary package.json.
   writeFileSync(join(dir, "consumer-esm.ts"), CONSUMER_SOURCE);
-  execFileSync(
-    TSC,
-    [
-      "--noEmit",
-      "--strict",
-      "--skipLibCheck",
-      "--module",
-      "nodenext",
-      "--moduleResolution",
-      "nodenext",
-      "--target",
-      "es2022",
-      "consumer-esm.ts",
-    ],
-    { cwd: dir, stdio: "pipe", shell: true },
-  );
+  execFileSync(process.execPath, [...tscArgs, "consumer-esm.ts"], { cwd: dir, stdio: "pipe" });
 
   // (b) "require" + "types" condition — same source, CJS resolution mode.
   writeFileSync(join(dir, "consumer-cjs.cts"), CONSUMER_SOURCE);
-  execFileSync(
-    TSC,
-    [
-      "--noEmit",
-      "--strict",
-      "--skipLibCheck",
-      "--module",
-      "nodenext",
-      "--moduleResolution",
-      "nodenext",
-      "--target",
-      "es2022",
-      "consumer-cjs.cts",
-    ],
-    { cwd: dir, stdio: "pipe", shell: true },
-  );
+  execFileSync(process.execPath, [...tscArgs, "consumer-cjs.cts"], { cwd: dir, stdio: "pipe" });
 
   console.log('smoke:types ok — both exports map "types" conditions resolve for a real npm install');
 } finally {

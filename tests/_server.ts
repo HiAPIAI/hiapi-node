@@ -50,11 +50,26 @@ export class MockServer {
         };
         this.requests.push(recorded);
         // Allow a handler to delay its response (e.g. to test behavior while
-        // a request is genuinely in-flight) by returning a Promise.
-        Promise.resolve(this.handler(recorded, this.requests.length - 1)).then((reply) => {
-          res.writeHead(reply.status ?? 200, reply.headers ?? {});
-          res.end(reply.body ?? "");
-        });
+        // a request is genuinely in-flight) by returning a Promise. Wrapped
+        // in try/catch (a handler can throw synchronously, before returning
+        // anything a `.then()`/`.catch()` chain would ever see) and with an
+        // explicit `.catch()` (an async handler's rejection would otherwise
+        // be an unhandled rejection) — either failure mode used to leave the
+        // connection hanging with no response, turning a test assertion
+        // thrown from inside a handler into a confusing timeout instead of
+        // the real failure.
+        try {
+          Promise.resolve(this.handler(recorded, this.requests.length - 1))
+            .then((reply) => {
+              res.writeHead(reply.status ?? 200, reply.headers ?? {});
+              res.end(reply.body ?? "");
+            })
+            .catch((err) => {
+              res.destroy(err instanceof Error ? err : new Error(String(err)));
+            });
+        } catch (err) {
+          res.destroy(err instanceof Error ? err : new Error(String(err)));
+        }
       });
     });
     await new Promise<void>((resolve) => this.server!.listen(0, "127.0.0.1", resolve));

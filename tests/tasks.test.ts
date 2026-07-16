@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
 
-import { HiAPI, PollTimeoutError, TaskFailedError } from "../src/index.js";
+import { HiAPI, HiAPIError, PollTimeoutError, TaskFailedError } from "../src/index.js";
 import { jsonReply, startMock, type MockServer } from "./_server.js";
 
 let mock: MockServer;
@@ -28,6 +28,23 @@ describe("tasks.create", () => {
     assert.equal(created.idempotentReplay, false);
     assert.deepEqual(JSON.parse(mock.requests[0].body), { model: "m", input: { prompt: "hi" } });
     assert.equal(mock.requests[0].headers["idempotency-key"], undefined);
+  });
+
+  test("rejects an anomalous 2xx response with no (or whitespace-only) taskId", async () => {
+    mock.reset(() => jsonReply({ data: {} }));
+    await assert.rejects(
+      client().tasks.create({ model: "m", input: {} }),
+      (err: unknown) => {
+        assert.ok(err instanceof HiAPIError);
+        assert.match(err.message, /did not include a taskId/);
+        return true;
+      },
+    );
+
+    // Truthy but meaningless: a bare truthiness check on taskId wouldn't
+    // catch this, and it would go on to poll `/tasks/%20%20%20`.
+    mock.reset(() => jsonReply({ data: { taskId: "   " } }));
+    await assert.rejects(client().tasks.create({ model: "m", input: {} }), HiAPIError);
   });
 
   test("route: '' is omitted like the other SDKs ('' ≡ absent ≡ default)", async () => {
@@ -105,6 +122,7 @@ describe("tasks.create", () => {
 
 describe("tasks.retrieve", () => {
   test("URL-encodes the task id", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "a/b c", model: "m", status: "queued" } }));
     await client().tasks.retrieve("a/b c");
     assert.equal(mock.requests[0].path, "/v1/tasks/a%2Fb%20c");
   });
@@ -127,6 +145,20 @@ describe("tasks.retrieve", () => {
     assert.equal(task.succeeded, true);
     assert.equal(task.output[0].url, "https://cdn/x.png");
     assert.equal(task.output[0].expireAt, 1700600000);
+  });
+
+  test("rejects a response describing a different task (misattribution guard)", async () => {
+    // Simulates a caching/routing bug on the server returning task B's data
+    // for a request about task A — silently accepting this would misattribute
+    // B's output to A rather than surfacing the protocol violation.
+    mock.reset(() =>
+      jsonReply({ data: { taskId: "wrong-task", model: "m", status: "success" } }),
+    );
+    await assert.rejects(client().tasks.retrieve("t9"), (err: unknown) => {
+      assert.ok(err instanceof HiAPIError);
+      assert.match(err.message, /wrong-task.*does not match.*t9/);
+      return true;
+    });
   });
 });
 
