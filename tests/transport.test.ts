@@ -20,7 +20,7 @@ import {
 } from "../src/index.js";
 import type { FetchLike } from "../src/index.js";
 import { normalizeBaseUrl, retryDelayMs } from "../src/transport.js";
-import { jsonReply, startMock, type MockServer } from "./_server.js";
+import { jsonReply, MockServer, startMock } from "./_server.js";
 
 let mock: MockServer;
 
@@ -277,6 +277,39 @@ describe("abort during retry", () => {
         signal: new AbortController().signal,
       }),
       APIConnectionError,
+    );
+  });
+
+  test("a timeout that genuinely fired FIRST is still correctly classified even if the caller's signal also aborts before the fetch's rejection surfaces", async () => {
+    // createAttemptSignal records which source won atomically, at the exact
+    // moment each one fires — not re-derived later from a fresh
+    // `callerSignal.aborted` check. That check can't tell "the timeout
+    // genuinely fired first, and the caller's abort call — a no-op, since
+    // AbortController.abort() on an already-aborted controller doesn't
+    // change anything — merely happened to land afterward" apart from "the
+    // caller's abort is what actually caused this failure": confirmed by
+    // reproducing exactly the former with a custom fetch that delays its
+    // rejection after the signal fires, letting a caller abort call land in
+    // between — an earlier revision let the later caller reason win,
+    // incorrectly skipping a retry the genuine timeout was eligible for.
+    const controller = new AbortController();
+    const impl: FetchLike = (_input, init) => {
+      const signal = init?.signal;
+      return new Promise((_, reject) => {
+        signal?.addEventListener("abort", () => {
+          // The caller's own abort call, landing in the same tick as the
+          // timeout's "abort" event — but the timeout already won.
+          controller.abort(new Error("caller abort — must NOT win"));
+          setTimeout(() => reject(new TypeError("fetch failed")), 20);
+        });
+      });
+    };
+    await assert.rejects(
+      client({ fetch: impl, timeoutMs: 10, maxRetries: 0 }).tasks.retrieve("t", controller.signal),
+      (err: unknown) => {
+        assert.ok(err instanceof APIConnectionError);
+        return true;
+      },
     );
   });
 
@@ -612,5 +645,20 @@ describe("mock server error handling (test infra self-check)", () => {
       throw new Error("boom-async");
     });
     await assert.rejects(client({ maxRetries: 0 }).tasks.retrieve("t"), APIConnectionError);
+  });
+
+  test("start() rejects clearly when listen() fails, instead of hanging forever", async () => {
+    // An earlier revision only ever wired listen()'s success callback — a
+    // real failure (EADDRINUSE, EPERM in a restricted sandbox, etc.) left
+    // the returned promise permanently pending, turning a genuine startup
+    // error into a confusing hang indistinguishable from an unrelated
+    // timeout. Binding a second server to an already-bound port reliably
+    // reproduces a real listen() failure (EADDRINUSE).
+    const busy = await new MockServer().start();
+    try {
+      await assert.rejects(new MockServer().start(busy.port));
+    } finally {
+      await busy.close();
+    }
   });
 });

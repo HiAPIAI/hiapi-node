@@ -254,19 +254,24 @@ export class RunFailedError extends HiAPIError {
  * `Symbol.toPrimitive` for a non-`Error` object — confirmed via `node -e`
  * that a plain object with a throwing `toString()` makes `String(...)`
  * itself throw. `cause.message` for an actual `Error` instance has the same
- * failure mode one level up: a `message` defined as a throwing getter (an
- * earlier revision of this function left that access unguarded, reasoning
- * — wrongly — that `instanceof Error` alone made it safe) throws too,
- * confirmed the same way. Either one runs inside {@link RunFailedError}'s
- * constructor, so it would make constructing the error throw a completely
- * different, `cause`-less, `taskId`-less error instead — defeating the
- * entire point of carrying `cause` and `taskId` for an already-created,
- * possibly-billing task.
+ * failure mode one level up: a `message` defined as a throwing getter
+ * throws too, confirmed the same way.
+ *
+ * `cause.message` is typed `string` by TypeScript's `Error` interface, but
+ * that's a compile-time-only guarantee — nothing stops a `message` getter
+ * from returning a non-string value at runtime. An earlier revision of this
+ * function `return`ed it as-is on the strength of that type alone, so the
+ * ACTUAL ToString conversion only happened later, in {@link RunFailedError}'s
+ * own template literal — outside this function's `try`, reproducing the
+ * exact same escape one level removed (confirmed the same way: a `message`
+ * getter returning an object with a throwing `toString()`). `String(...)`
+ * is applied to it explicitly, inside this `try`, so the coercion — and any
+ * throw it can produce — happens where it's actually caught.
  */
 function describeCause(cause: unknown): string {
   try {
     if (cause instanceof Error) {
-      return cause.message;
+      return String(cause.message);
     }
     return String(cause);
   } catch {

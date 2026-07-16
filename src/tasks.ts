@@ -66,6 +66,18 @@ export interface CreateTaskParams {
    * `IdempotencyKeyMismatchError`.
    */
   idempotencyKey?: string;
+  /**
+   * Aborts this request (including any pending retry-backoff sleep) — same
+   * mechanism as `list()`/`retrieve()`. Does NOT guarantee the task was
+   * never created: if the abort lands after the `POST` has already reached
+   * the server, the task may still be created (and billed) even though this
+   * call throws — the same "outcome unknown" situation a `create()` call
+   * without `idempotencyKey` already has for a plain network failure. This
+   * only changes how PROMPTLY a cancellation is noticed, not the
+   * transport's retry-safety rules for network errors (already gated by
+   * `idempotencyKey`, unaffected by `signal`).
+   */
+  signal?: AbortSignal;
 }
 
 export interface WaitOptions {
@@ -166,6 +178,7 @@ export class Tasks {
     const [env, respHeaders] = await this.transport.requestWithHeaders("POST", "/tasks", {
       body,
       extraHeaders,
+      signal: params.signal,
     });
     const replay = (respHeaders.get("idempotent-replay") ?? "").toLowerCase() === "true";
     const created = CreatedTask.fromJSON(data(env), replay);
@@ -355,20 +368,27 @@ export class Tasks {
    * Equivalent to {@link create} followed by {@link wait}. `callback` is
    * optional and independent of polling; set it if you also want a webhook.
    *
-   * `signal` is checked before `create()` is ever called and again right
-   * after, and `pollIntervalMs`/`timeoutMs` are validated up front too —
-   * `create()` has no signal awareness of its own (there is no in-flight
-   * request to cancel; a `POST /tasks` is not safe to abandon mid-flight
-   * since it may already have billed), so without all of this an
-   * already-aborted `signal`, or a `wait()`-bound config mistake (e.g.
-   * `pollIntervalMs: 0`), would still let the task get created before ever
-   * discovering it can't actually be polled for. Once the task exists, every
-   * other way `run()` can fail (an abort landing later, a network/API error
-   * while polling, an `onUpdate` rejection) is wrapped in
-   * {@link RunFailedError} so the `taskId` is never lost — except
+   * `signal` is checked before `create()` is ever called (a fast fail — an
+   * already-aborted call shouldn't even build the request) and forwarded
+   * into `create()` itself (which respects it the same way `list()`/
+   * `retrieve()` do — see {@link CreateTaskParams.signal}), so an abort
+   * during creation now surfaces promptly from `create()` directly (an
+   * unenriched error — there's no `taskId` yet to attach to it, the same
+   * "outcome unknown" shape any other `create()`-time failure already has).
+   * `pollIntervalMs`/`timeoutMs` are also validated up front, so a
+   * `wait()`-bound config mistake (e.g. `pollIntervalMs: 0`) doesn't still
+   * let the task get created before ever discovering it can't actually be
+   * polled for. `signal` is checked once more right after `create()`
+   * resolves as a defensive backstop — `create()` has no further `await`
+   * between its network call resolving and returning, so in practice there
+   * is no gap left for an external abort to land in this specific window —
+   * but if one ever did, it throws {@link RunAbortedError} carrying
+   * `taskId` (the task exists, and, unlike the pre-`create()` case, may
+   * already bill). Once the task exists, every OTHER way `run()` can fail
+   * (a network/API error while polling, an `onUpdate` rejection) is wrapped
+   * in {@link RunFailedError} so the `taskId` is never lost — except
    * `TaskFailedError` and `PollTimeoutError` **for this same task**, which
-   * already carry it and are re-thrown unchanged. See {@link RunAbortedError}
-   * for the immediate post-creation case.
+   * already carry it and are re-thrown unchanged.
    */
   async run(params: RunParams): Promise<Task> {
     params.signal?.throwIfAborted();

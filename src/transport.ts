@@ -222,7 +222,10 @@ export class Transport {
       // every iteration) detaches both listeners and clears the timer
       // immediately once this attempt is done, so nothing accumulates no
       // matter how many attempts a call ends up making.
-      const { signal: attemptSignal, dispose } = createAttemptSignal(opts.signal, this.timeoutMs);
+      const { signal: attemptSignal, causedByCaller, dispose } = createAttemptSignal(
+        opts.signal,
+        this.timeoutMs,
+      );
       try {
         let status: number;
         let respHeaders: Headers;
@@ -247,12 +250,18 @@ export class Transport {
           if (err instanceof HiAPIError) {
             throw err;
           }
-          // The CALLER's signal (not the per-attempt timeout, which produces
-          // the identical DOMException shape) firing must surface as a plain
+          // The CALLER's abort (not the per-attempt timeout, which produces
+          // the identical DOMException shape) must surface as a plain
           // abort, not get wrapped in APIConnectionError or retried — the
           // caller asked to stop, not "the network failed, try again".
-          if (opts.signal?.aborted) {
-            throw opts.signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+          // `causedByCaller()` — not a fresh `opts.signal?.aborted` check —
+          // because the caller's signal can become aborted AFTER the
+          // timeout already fired and legitimately caused this exact
+          // failure (a slow-to-reject fetch can leave both true by the time
+          // this runs); only the attempt signal's own recorded FIRST cause
+          // reflects which one actually did.
+          if (causedByCaller()) {
+            throw opts.signal!.reason ?? new DOMException("This operation was aborted", "AbortError");
           }
           // Anything else fetch throws is network-level: DNS, refused/reset
           // connections, TLS failures, or the per-attempt timeout firing.
@@ -392,18 +401,33 @@ function abortReason(signal: AbortSignal): unknown {
 function createAttemptSignal(
   callerSignal: AbortSignal | undefined,
   timeoutMs: number,
-): { signal: AbortSignal; dispose: () => void } {
+): { signal: AbortSignal; causedByCaller: () => boolean; dispose: () => void } {
   const controller = new AbortController();
+  // Recorded atomically, at the exact moment each source actually wins the
+  // race — NOT re-derived later from `callerSignal.aborted`. A later check
+  // of that flag can't tell "the timeout fired first, and the caller
+  // happened to abort afterward, before the fetch's rejection even
+  // surfaced" apart from "the caller's abort is what actually caused this
+  // failure": confirmed by reproducing exactly the former with a custom
+  // fetch that delays its rejection — `callerSignal.aborted` was already
+  // `true` by the time the catch block ran, so the LATER caller reason won
+  // out over the timeout that had genuinely fired first, and skipped a
+  // retry the timeout would otherwise have been eligible for.
+  let causedByCaller = false;
   const timer = setTimeout(() => {
+    if (controller.signal.aborted) return;
     controller.abort(new DOMException(`signal timed out after ${timeoutMs}ms`, "TimeoutError"));
   }, timeoutMs);
   // Doesn't itself keep the process alive — this timer exists to bound an
   // already-pending request, not to schedule work of its own.
   timer.unref?.();
   const onCallerAbort = () => {
+    if (controller.signal.aborted) return;
+    causedByCaller = true;
     controller.abort(callerSignal!.reason);
   };
   if (callerSignal?.aborted) {
+    causedByCaller = true;
     clearTimeout(timer);
     controller.abort(callerSignal.reason);
   } else {
@@ -411,6 +435,7 @@ function createAttemptSignal(
   }
   return {
     signal: controller.signal,
+    causedByCaller: () => causedByCaller,
     dispose: () => {
       clearTimeout(timer);
       callerSignal?.removeEventListener("abort", onCallerAbort);
@@ -438,7 +463,17 @@ function describeError(err: unknown): string {
       if (cause instanceof Error && cause.message) {
         return `${err.message} (${cause.message})`;
       }
-      return err.message || err.name;
+      // `String(...)` applied explicitly: `err.message`/`err.name` are typed
+      // `string` by TypeScript's `Error` interface, but that's compile-time
+      // only — nothing stops either from being redefined as a non-string
+      // getter at runtime. Returning either AS-IS on the strength of that
+      // type alone (an earlier revision did) meant the actual ToString
+      // conversion only happened later, in the caller's own template
+      // literal — outside this function's `try` — reproducing the exact
+      // escape this function exists to prevent, one level removed
+      // (confirmed the same way: a `message` getter returning an object
+      // with a throwing `toString()`).
+      return String(err.message || err.name);
     }
     return String(err);
   } catch {

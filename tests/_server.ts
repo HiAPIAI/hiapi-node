@@ -35,9 +35,11 @@ export class MockServer {
   requests: RecordedRequest[] = [];
   handler: MockHandler = () => jsonReply({ data: {} });
   url = "";
+  port = 0;
   private server: Server | undefined;
 
-  async start(): Promise<this> {
+  /** `port` defaults to 0 (OS-assigned) — pass an already-bound port to test listen() failure paths. */
+  async start(port = 0): Promise<this> {
     this.server = createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on("data", (c: Buffer) => chunks.push(c));
@@ -72,8 +74,27 @@ export class MockServer {
         }
       });
     });
-    await new Promise<void>((resolve) => this.server!.listen(0, "127.0.0.1", resolve));
+    // Both "listening" and "error" are raced — listen() only ever invokes
+    // its own callback on success, never on failure (EADDRINUSE, EPERM in a
+    // sandboxed/restricted environment, etc.), so a bare `resolve` callback
+    // left this promise permanently pending on a real listen failure: the
+    // suite's before-hook hung instead of failing with a clear cause,
+    // indistinguishable from an unrelated timeout.
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: Error) => {
+        this.server!.removeListener("listening", onListening);
+        reject(err);
+      };
+      const onListening = () => {
+        this.server!.removeListener("error", onError);
+        resolve();
+      };
+      this.server!.once("error", onError);
+      this.server!.once("listening", onListening);
+      this.server!.listen(port, "127.0.0.1");
+    });
     const addr = this.server!.address() as AddressInfo;
+    this.port = addr.port;
     this.url = `http://127.0.0.1:${addr.port}`;
     return this;
   }

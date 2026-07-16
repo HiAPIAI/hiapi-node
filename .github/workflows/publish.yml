@@ -13,10 +13,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: Verify the tagged commit is on main
+        # A tag matching v* is enough to trigger this workflow regardless of
+        # which commit it points to — checking out that ref alone doesn't
+        # prove it's part of main's reviewed history. Without this, an
+        # account with push (tag) access but no merge access to main could
+        # publish an arbitrary, unreviewed commit — one that could also
+        # modify prepack/test and touch NPM_TOKEN during npm publish.
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tagged commit $GITHUB_SHA is not part of origin/main — refusing to publish from an unreviewed commit"
+            exit 1
+          fi
       - run: npm ci
       - name: Verify tag matches package.json version
         run: |

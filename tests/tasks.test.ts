@@ -765,9 +765,9 @@ describe("tasks.run", () => {
   });
 
   test("a pre-aborted signal is honoured before create() ever fires — no POST is sent", async () => {
-    // create() has no signal awareness of its own (a POST is never safe to
-    // abandon mid-flight — it may already have billed), so without this
-    // check, run() would still create a task from an already-aborted call.
+    // Checked up front as a fast fail, on top of create()'s own signal
+    // awareness (see CreateTaskParams.signal) — no reason to even build the
+    // request body/headers for a call that's already been cancelled.
     const controller = new AbortController();
     controller.abort();
     await assert.rejects(
@@ -780,16 +780,40 @@ describe("tasks.run", () => {
     assert.equal(mock.requests.length, 0);
   });
 
-  test("an abort landing right after create() succeeds throws RunAbortedError carrying the taskId", async () => {
-    mock.reset(() => jsonReply({ data: { taskId: "r2" } }));
+  test("RunAbortedError carries taskId and cause (constructed directly — see note below on why run() can no longer reach this via a realistic race)", () => {
+    // run()'s own `if (params.signal?.aborted) throw new
+    // RunAbortedError(...)` check, right after `await this.create(params)`,
+    // used to be reachable via a race: an abort landing in the gap between
+    // create()'s underlying request settling and this check running. Now
+    // that create() is itself signal-aware (CreateTaskParams.signal), that
+    // gap has closed for any REALISTIC caller: create()'s own code has no
+    // further `await` between its network call resolving and returning, so
+    // there is no yield point for an external timer/event to land in — an
+    // abort either arrives before create() is called (caught by run()'s
+    // pre-check), during create()'s own network operation (now caught by
+    // create() itself, propagating unwrapped — see the test below), or, if
+    // it fires any later, run() has already moved past this check entirely.
+    // The check remains as a defensive backstop (e.g. against a future
+    // create() gaining its own internal `await` after the network call),
+    // so RunAbortedError itself is still tested directly here rather than
+    // deleted.
+    const cause = new Error("cancelled by caller");
+    const err = new RunAbortedError("r2", { cause });
+    assert.equal(err.taskId, "r2");
+    assert.equal(err.cause, cause);
+    assert.match(err.message, /r2/);
+  });
+
+  test("an abort landing DURING create()'s own network operation propagates unwrapped, the same 'outcome unknown' shape create() failures already have", async () => {
+    // Once headers arrive but before create() finishes reading/decoding the
+    // body, the task may already exist server-side — yet there's no taskId
+    // in hand yet to enrich an error with. This is the SAME shape as any
+    // other create()-time failure (e.g. a plain network error) already has:
+    // create()'s errors propagate out of run() unwrapped, since run()'s own
+    // try/catch only wraps wait(), not create().
+    mock.reset(() => jsonReply({ data: { taskId: "r2b" } }));
     const controller = new AbortController();
     const reason = new Error("cancelled by caller");
-    // A custom fetch that aborts the controller right as create()'s POST
-    // resolves — reproducing the exact race run() guards against: the
-    // signal fires in the window between the task existing server-side and
-    // run()'s post-create check running, with no mocked GET configured, so
-    // this also proves wait() is never reached (an unexpected request shape
-    // would otherwise fail the test).
     const raceClient = new HiAPI({
       apiKey: "sk-test",
       baseUrl: mock.url,
@@ -803,13 +827,7 @@ describe("tasks.run", () => {
     });
     await assert.rejects(
       raceClient.tasks.run({ model: "m", input: {}, signal: controller.signal }),
-      (err: unknown) => {
-        assert.ok(err instanceof RunAbortedError);
-        assert.equal(err.taskId, "r2");
-        assert.equal(err.cause, reason);
-        assert.match(err.message, /r2/);
-        return true;
-      },
+      (err: unknown) => err === reason,
     );
     assert.equal(mock.requests.length, 1);
   });
