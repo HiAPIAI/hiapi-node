@@ -253,17 +253,21 @@ export class RunFailedError extends HiAPIError {
  * does the same ToString conversion) calls `cause`'s own `toString`/
  * `Symbol.toPrimitive` for a non-`Error` object — confirmed via `node -e`
  * that a plain object with a throwing `toString()` makes `String(...)`
- * itself throw. Since this runs inside {@link RunFailedError}'s constructor,
- * that would make constructing the error throw a completely different,
- * `cause`-less, `taskId`-less error instead — defeating the entire point of
- * carrying `cause` and `taskId` for an already-created, possibly-billing
- * task.
+ * itself throw. `cause.message` for an actual `Error` instance has the same
+ * failure mode one level up: a `message` defined as a throwing getter (an
+ * earlier revision of this function left that access unguarded, reasoning
+ * — wrongly — that `instanceof Error` alone made it safe) throws too,
+ * confirmed the same way. Either one runs inside {@link RunFailedError}'s
+ * constructor, so it would make constructing the error throw a completely
+ * different, `cause`-less, `taskId`-less error instead — defeating the
+ * entire point of carrying `cause` and `taskId` for an already-created,
+ * possibly-billing task.
  */
 function describeCause(cause: unknown): string {
-  if (cause instanceof Error) {
-    return cause.message;
-  }
   try {
+    if (cause instanceof Error) {
+      return cause.message;
+    }
     return String(cause);
   } catch {
     return `<un-stringifiable ${typeof cause}>`;

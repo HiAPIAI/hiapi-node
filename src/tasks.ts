@@ -259,22 +259,22 @@ export class Tasks {
       options.signal?.throwIfAborted();
       if (options.onUpdate && task.status !== lastStatus) {
         lastStatus = task.status;
-        // The polling `deadline` must NOT apply to a *terminal* status's
-        // onUpdate call: `retrieve()` above already has the real answer
-        // (success/fail) in hand, so a merely-slow callback racing past the
-        // deadline must never turn a task that has already finished into a
-        // false PollTimeoutError — confirmed by reproducing exactly that
-        // (a "success" response with a callback slower than the timeout
-        // threw PollTimeoutError instead of returning the task). Passed
-        // `Infinity` here reuses raceOnUpdate's existing "no deadline"
-        // branch; `signal` is still raced either way — an explicit abort is
-        // a request to stop caring about this task, terminal or not.
+        // For a *terminal* status, `onDeadline: "abandon"` means the
+        // polling deadline elapsing gives up on `onUpdate` (resolves)
+        // rather than rejecting: `retrieve()` above already has the real
+        // answer (success/fail) in hand, so a merely-slow callback racing
+        // past the deadline must never turn a task that has already
+        // finished into a false PollTimeoutError (confirmed by reproducing
+        // exactly that). `signal` is still raced the same way either way —
+        // an explicit abort is a request to stop caring about this task,
+        // terminal or not.
         await raceOnUpdate(
           options.onUpdate(task),
           options.signal,
           taskId,
           timeoutMs,
-          task.isTerminal ? Infinity : deadline,
+          deadline,
+          task.isTerminal ? "abandon" : "reject",
         );
         // Re-checked once more: onUpdate settling normally doesn't itself
         // prove the signal wasn't aborted in the same tick it resolved —
@@ -340,16 +340,23 @@ export class Tasks {
         signal: params.signal,
       });
     } catch (err) {
-      // Matched by taskId, not just `instanceof` — an `onUpdate` is
-      // arbitrary caller code and could itself call into this SDK for a
-      // DIFFERENT task (e.g. its own nested `wait()`); that call's
-      // TaskFailedError/PollTimeoutError would otherwise pass straight
-      // through `run()` unwrapped, handing the caller a task id that isn't
-      // `created.taskId` at all — confirmed by reproducing exactly that
-      // with an onUpdate throwing `PollTimeoutError("other-task", ...)`.
+      // Two checks, not just taskId matching: an `onUpdate` is arbitrary
+      // caller code and could itself call into this SDK — including a
+      // NESTED wait()/run() for the very same task, whose own
+      // TaskFailedError/PollTimeoutError would then have a taskId that
+      // matches `created.taskId` too, yet isn't actually about the outer
+      // wait() loop this run() call owns (confirmed by reproducing exactly
+      // that: a same-taskId PollTimeoutError thrown from inside onUpdate
+      // otherwise passed straight through unwrapped). `CALLBACK_ORIGINATED`
+      // — set only where raceOnUpdate observes onUpdate's own promise
+      // rejecting, not for the outer loop's own errors — resolves that;
+      // taskId matching alone was the round-9 fix and stays as a second,
+      // belt-and-suspenders check.
+      const fromCallback = err !== null && typeof err === "object" && CALLBACK_ORIGINATED.has(err);
       if (
-        (err instanceof TaskFailedError && err.task.taskId === created.taskId) ||
-        (err instanceof PollTimeoutError && err.taskId === created.taskId)
+        !fromCallback &&
+        ((err instanceof TaskFailedError && err.task.taskId === created.taskId) ||
+          (err instanceof PollTimeoutError && err.taskId === created.taskId))
       ) {
         throw err;
       }
@@ -404,6 +411,15 @@ function validateWaitOptions(pollIntervalMs: number, timeoutMs: number): void {
  * `wait()` past both controls entirely (confirmed by reproducing exactly
  * that: a never-settling callback stayed pending well past both an already-
  * elapsed `timeoutMs` and a `signal` aborted during the call).
+ *
+ * `onDeadline` controls what happens if `deadline` is the one that wins:
+ * `"reject"` (the default, for a non-terminal status) rejects with
+ * `PollTimeoutError`. `"abandon"` (for a terminal status) resolves instead —
+ * `retrieve()` already has the real success/fail answer in hand at that
+ * point, so a merely-slow callback must never turn an already-finished task
+ * into a false timeout; onUpdate itself is simply given up on; the caller's
+ * own `signal`, if any, is still the only way to actually stop waiting for
+ * an onUpdate that never settles at all.
  */
 function raceOnUpdate(
   result: void | Promise<void>,
@@ -411,6 +427,7 @@ function raceOnUpdate(
   taskId: string,
   timeoutMs: number,
   deadline: number,
+  onDeadline: "reject" | "abandon" = "reject",
 ): Promise<void> {
   const settledResult = Promise.resolve(result);
   if (!signal && !Number.isFinite(deadline)) {
@@ -443,6 +460,16 @@ function raceOnUpdate(
       cleanup();
       reject(signal!.reason ?? new DOMException("This operation was aborted", "AbortError"));
     };
+    // Registered BEFORE arming the deadline timer below, not after: arming
+    // can synchronously detect an already-elapsed deadline (its very first,
+    // synchronous call) and call cleanup() immediately — cleanup() calls
+    // removeEventListener for a listener that, had this ordering been
+    // reversed, wouldn't have been added yet. Execution would then fall
+    // through to an addEventListener call AFTER settled was already true,
+    // registering a listener nothing ever removes: confirmed by reproducing
+    // exactly that with one AbortController reused across several
+    // already-timed-out waits, each leaking one more listener on it.
+    signal?.addEventListener("abort", onAbort, { once: true });
     if (Number.isFinite(deadline)) {
       // A single `setTimeout` can't span more than Node's real (signed
       // 32-bit) timer limit (`MAX_TIMER_DELAY_MS`, ~24.85 days) — clamping
@@ -460,14 +487,17 @@ function raceOnUpdate(
         if (remainingMs <= 0) {
           if (settled) return;
           cleanup();
-          reject(new PollTimeoutError(taskId, timeoutMs));
+          if (onDeadline === "abandon") {
+            resolve();
+          } else {
+            reject(new PollTimeoutError(taskId, timeoutMs));
+          }
           return;
         }
         timer = setTimeout(armTimer, Math.min(remainingMs, MAX_TIMER_DELAY_MS));
       };
       armTimer();
     }
-    signal?.addEventListener("abort", onAbort, { once: true });
     settledResult.then(
       (value) => {
         if (settled) return;
@@ -477,11 +507,37 @@ function raceOnUpdate(
       (err: unknown) => {
         if (settled) return;
         cleanup();
+        // Marked here specifically — not for the PollTimeoutError/
+        // AbortError raceOnUpdate itself produces above for a genuine
+        // deadline/signal reason — because this is precisely "onUpdate's
+        // own promise rejected": the only place that distinction can be
+        // made. run()'s catch needs it to tell an error that came from
+        // INSIDE onUpdate (even an SDK error type with a matching taskId —
+        // e.g. onUpdate does its own nested wait() for the very same task,
+        // and that throws its own PollTimeoutError) apart from the outer
+        // wait() loop's own TaskFailedError/PollTimeoutError, which taskId
+        // matching alone can't distinguish (confirmed by reproducing a
+        // same-taskId nested PollTimeoutError passing straight through
+        // run() unwrapped).
+        if (err !== null && typeof err === "object") {
+          CALLBACK_ORIGINATED.add(err);
+        }
         reject(err);
       },
     );
   });
 }
+
+/**
+ * Marks an error/rejection value as having originated from inside an
+ * `onUpdate` callback's own execution, so `run()`'s catch block can tell it
+ * apart from an error the outer `wait()` loop's own control flow produced
+ * directly — see the marking site in {@link raceOnUpdate} and the check in
+ * {@link Tasks.run} for why `instanceof`/`taskId` matching alone can't make
+ * that distinction. A `WeakSet` avoids retaining anything once the error
+ * itself is no longer referenced elsewhere.
+ */
+const CALLBACK_ORIGINATED = new WeakSet<object>();
 
 function data(env: JSONObject): JSONObject {
   const d = env.data;

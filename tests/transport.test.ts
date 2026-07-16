@@ -276,6 +276,31 @@ describe("network-error retry gates", () => {
       },
     );
   });
+
+  test("a custom fetch rejecting with a throwing-toString() reason still surfaces as APIConnectionError, not a secondary error", async () => {
+    // `fetch` is a documented, user-replaceable option — a custom
+    // implementation can reject with anything, including a non-Error object
+    // with a throwing toString(). describeError() used to call String(err)
+    // unguarded for exactly this case, making the transport itself throw a
+    // completely different, unrelated error instead of APIConnectionError,
+    // discarding the real cause.
+    const throwingReason = {
+      toString() {
+        throw new Error("toString boom");
+      },
+    };
+    const impl: FetchLike = async () => {
+      throw throwingReason;
+    };
+    await assert.rejects(
+      client({ fetch: impl, maxRetries: 0 }).tasks.retrieve("t"),
+      (err: unknown) => {
+        assert.ok(err instanceof APIConnectionError);
+        assert.equal(err.cause, throwingReason);
+        return true;
+      },
+    );
+  });
 });
 
 describe("idempotencyKey validation", () => {

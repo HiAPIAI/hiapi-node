@@ -331,17 +331,32 @@ function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException("This operation was aborted", "AbortError");
 }
 
+/**
+ * Describes an arbitrary thrown/rejected value for an error message,
+ * without ever throwing itself. `fetch` is a documented, user-replaceable
+ * option (see `HiAPIOptions.fetch`); a custom implementation can reject with
+ * anything, including a non-Error object with a throwing `toString()`, or —
+ * subtler — an `Error` whose own `message` is a throwing getter. Either one
+ * used to make THIS function throw a completely different, secondary error
+ * instead of the intended `APIConnectionError`, discarding `cause` — the
+ * same class of bug `errors.ts`'s `describeCause` guards against for
+ * `RunFailedError`, confirmed here via the same kind of reproduction.
+ */
 function describeError(err: unknown): string {
-  if (err instanceof Error) {
-    // Node's fetch wraps the interesting failure (ECONNREFUSED, DNS, ...) in
-    // `cause`; surface it alongside the generic "fetch failed" message.
-    const cause = (err as { cause?: unknown }).cause;
-    if (cause instanceof Error && cause.message) {
-      return `${err.message} (${cause.message})`;
+  try {
+    if (err instanceof Error) {
+      // Node's fetch wraps the interesting failure (ECONNREFUSED, DNS, ...) in
+      // `cause`; surface it alongside the generic "fetch failed" message.
+      const cause = (err as { cause?: unknown }).cause;
+      if (cause instanceof Error && cause.message) {
+        return `${err.message} (${cause.message})`;
+      }
+      return err.message || err.name;
     }
-    return err.message || err.name;
+    return String(err);
+  } catch {
+    return `<un-stringifiable ${typeof err}>`;
   }
-  return String(err);
 }
 
 async function safeText(resp: Response): Promise<string> {

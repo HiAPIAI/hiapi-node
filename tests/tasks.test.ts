@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { after, before, beforeEach, describe, test } from "node:test";
 
 import {
@@ -397,6 +398,63 @@ describe("tasks.wait", () => {
     );
   });
 
+  test("a hanging (never-settling) onUpdate for a terminal status is abandoned at the deadline — the real result still comes back, not a hang", async () => {
+    // A round-9 regression in the OTHER direction from the two tests above:
+    // giving the terminal onUpdate call an unbounded (Infinity) deadline
+    // fixed the false-timeout bug, but meant a genuinely hanging callback
+    // with no AbortSignal at all would then block forever, contradicting
+    // wait()'s own documented timeoutMs budget. onDeadline: "abandon" gives
+    // up waiting on onUpdate once the (real, finite) deadline elapses —
+    // still returning the already-known terminal result.
+    mock.reset(() => statusReply("success"));
+    const started = performance.now();
+    const task = await client().tasks.wait("w1", {
+      pollIntervalMs: 5,
+      timeoutMs: 20,
+      onUpdate: () => new Promise<void>(() => {}),
+    });
+    assert.equal(task.status, "success");
+    assert.ok(performance.now() - started < 5_000);
+  });
+
+  test("a hanging (never-settling) onUpdate for a terminal fail status is abandoned at the deadline — TaskFailedError still throws, not a hang", async () => {
+    mock.reset(() => statusReply("fail", { error: { code: "X", message: "boom" } }));
+    const started = performance.now();
+    await assert.rejects(
+      client().tasks.wait("w1", {
+        pollIntervalMs: 5,
+        timeoutMs: 20,
+        onUpdate: () => new Promise<void>(() => {}),
+      }),
+      TaskFailedError,
+    );
+    assert.ok(performance.now() - started < 5_000);
+  });
+
+  test("a timed-out onUpdate race doesn't leak its AbortSignal listener", async () => {
+    // armTimer() can synchronously detect an already-elapsed deadline on
+    // its very first call — if the abort listener were registered AFTER
+    // arming (an earlier revision did this), that synchronous path would
+    // call cleanup() before the listener even existed, then register one
+    // right after that nothing would ever remove. Reusing one signal across
+    // several already-timed-out waits accumulated one leaked listener per
+    // call.
+    mock.reset(() => statusReply("queued"));
+    const controller = new AbortController();
+    for (let i = 0; i < 5; i++) {
+      await assert.rejects(
+        client().tasks.wait("w1", {
+          pollIntervalMs: 5,
+          timeoutMs: 10,
+          signal: controller.signal,
+          onUpdate: () => new Promise<void>(() => {}),
+        }),
+        PollTimeoutError,
+      );
+    }
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  });
+
   test("a timeoutMs beyond Node's single-timer limit doesn't crash or misfire when onUpdate resolves normally", async () => {
     // Doesn't (and practically can't, without waiting weeks or faking
     // performance.now(), which node:test's MockTimers doesn't support)
@@ -755,6 +813,23 @@ describe("tasks.run", () => {
     assert.match(err.message, /t1/);
   });
 
+  test("RunFailedError's own constructor never throws, even given an Error cause with a throwing message getter", () => {
+    // A round-9 revision guarded only String(cause), reasoning (wrongly)
+    // that `instanceof Error` alone made the `.message` access safe — an
+    // Error subclass with `message` defined as a throwing getter hits the
+    // exact same failure mode one level up, confirmed the same way.
+    const throwingMessageCause = new Error("placeholder");
+    Object.defineProperty(throwingMessageCause, "message", {
+      get() {
+        throw new Error("message getter boom");
+      },
+    });
+    const err = new RunFailedError("t2", throwingMessageCause);
+    assert.equal(err.taskId, "t2");
+    assert.equal(err.cause, throwingMessageCause);
+    assert.match(err.message, /t2/);
+  });
+
   test("TaskFailedError and PollTimeoutError from wait() are NOT wrapped — they already carry the taskId", async () => {
     mock.reset((_req, index) =>
       index === 0
@@ -810,6 +885,39 @@ describe("tasks.run", () => {
         assert.ok(err instanceof RunFailedError);
         assert.equal(err.taskId, "real");
         assert.equal(err.cause, otherTasksError);
+        return true;
+      },
+    );
+  });
+
+  test("a nested wait() for the SAME task from inside onUpdate is wrapped in RunFailedError, not passed through as the outer wait()'s own timeout", async () => {
+    // taskId matching alone (the round-9 fix) can't catch this: the nested
+    // call's PollTimeoutError carries the SAME taskId as the outer run()'s
+    // own task, yet isn't actually about the outer wait() loop this run()
+    // call owns. The outer poll interval/timeout are set generously large
+    // so its own deadline can't be what's firing here — only the nested
+    // wait()'s much shorter one can.
+    mock.reset((_req, index) =>
+      index === 0
+        ? jsonReply({ data: { taskId: "real" } })
+        : jsonReply({ data: { taskId: "real", model: "m", status: "queued" } }),
+    );
+    const c = client();
+    await assert.rejects(
+      c.tasks.run({
+        model: "m",
+        input: {},
+        pollIntervalMs: 60_000,
+        timeoutMs: 120_000,
+        onUpdate: async () => {
+          await c.tasks.wait("real", { pollIntervalMs: 5, timeoutMs: 10 });
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RunFailedError);
+        assert.equal(err.taskId, "real");
+        assert.ok(err.cause instanceof PollTimeoutError);
+        assert.equal((err.cause as PollTimeoutError).taskId, "real");
         return true;
       },
     );
