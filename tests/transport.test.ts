@@ -203,6 +203,43 @@ describe("HTTP status retries (429/503)", () => {
     assert.equal(callCount, 2);
   });
 
+  test("an exhausted known-429 retry surfaces a status-aware error, not a bare APIConnectionError", async () => {
+    // When the known-status retry budget runs out (or the status isn't
+    // retryable at all), an earlier revision fell all the way through to
+    // the generic network-error gate and threw APIConnectionError — losing
+    // the fact that the status was ALREADY definitively known, misrepresenting
+    // a genuine "server rejected this before processing" 429/503 as an
+    // ambiguous connection failure. Confirmed by reproducing exactly that
+    // with two known-429 responses (maxRetries: 0, so no retry budget at
+    // all) — the fix surfaces the real, status-mapped error instead.
+    const impl: FetchLike = async (_input, init) => {
+      const signal = init?.signal;
+      return {
+        ok: false,
+        status: 429,
+        headers: new Headers({ "Retry-After": "0" }),
+        text: () =>
+          new Promise<string>((_, reject) => {
+            const onAbort = () =>
+              reject(signal!.reason ?? new DOMException("timed out", "TimeoutError"));
+            if (signal?.aborted) {
+              onAbort();
+              return;
+            }
+            signal?.addEventListener("abort", onAbort, { once: true });
+          }),
+      } as unknown as Response;
+    };
+    await assert.rejects(
+      client({ fetch: impl, timeoutMs: 10, maxRetries: 0 }).tasks.create({ model: "m", input: {} }),
+      (err: unknown) => {
+        assert.ok(err instanceof APIError);
+        assert.equal((err as APIError).status, 429);
+        return true;
+      },
+    );
+  });
+
   test("an HTTP-date Retry-After on a real 429 is honoured through the full retry loop", async () => {
     // toUTCString() truncates to whole seconds, so a target under ~1s out can
     // round down to "now" or even the past. 1800ms guarantees a real wait
@@ -265,16 +302,18 @@ describe("abort during retry", () => {
   });
 
   test("an abort during a non-2xx response body read surfaces as AbortError, not a wrongly-mapped status error", async () => {
-    // safeText() used to swallow EVERY resp.text() failure, including one
-    // caused by the request's own signal aborting mid-read — the caller-
-    // abort check in the surrounding catch block never got a chance to run,
-    // since the body-read failure never reached it. Confirmed by
-    // reproducing an abort landing while a 404's body was still pending:
-    // the SDK produced NotFoundError instead of AbortError, even though
-    // `signal.aborted` was already true by the time status mapping ran. A
-    // hand-written fetch stub simulates a real "headers arrived, body still
-    // pending" response — the shared mock HTTP server can't hold a body
-    // open independently of its headers.
+    // An earlier revision's body-read helper (since removed — the catch
+    // block below now handles every body-read failure uniformly, whatever
+    // its cause) swallowed EVERY resp.text() failure, including one caused
+    // by the request's own signal aborting mid-read — the caller-abort
+    // check in the surrounding catch block never got a chance to run, since
+    // the body-read failure never reached it. Confirmed by reproducing an
+    // abort landing while a 404's body was still pending: the SDK produced
+    // NotFoundError instead of AbortError, even though `signal.aborted` was
+    // already true by the time status mapping ran. A hand-written fetch
+    // stub simulates a real "headers arrived, body still pending" response
+    // — the shared mock HTTP server can't hold a body open independently of
+    // its headers.
     const controller = new AbortController();
     const impl: FetchLike = async (_input, init) => {
       const signal = init?.signal;
@@ -605,6 +644,48 @@ describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {
       IdempotencyKeyProcessingError,
     );
     assert.equal(mock.requests.length, 3);
+  });
+
+  test("a 409 whose body read fails for a non-abort reason still retries with a key, honouring the already-captured Retry-After", async () => {
+    // The body-read helper this SDK used to have swallowed EVERY resp.text()
+    // failure not caused by an abort into an empty string, so
+    // errorFromResponse() could never discover error_code:
+    // IDEMPOTENCY_KEY_PROCESSING from it — an idempotency-keyed create()
+    // whose 409 body happened to fail reading (for a reason unrelated to
+    // any signal — a genuine stream error) surfaced a generic, uninformative
+    // 409 error instead of taking the safe replay path an otherwise-
+    // identical request with a READABLE body would have. The 1s
+    // Retry-After also verifies the retry uses the header already captured
+    // from this exact response, not a fallback that ignores it — the
+    // timing is the only way to tell those two apart.
+    let callCount = 0;
+    const impl: FetchLike = async (input, init) => {
+      callCount += 1;
+      if (callCount === 1) {
+        return {
+          ok: false,
+          status: 409,
+          headers: new Headers({ "Retry-After": "1" }),
+          text: () => Promise.reject(new Error("stream reset")),
+        } as unknown as Response;
+      }
+      return fetch(input, init);
+    };
+    mock.reset(() => jsonReply({ data: { taskId: "first" } }, 200, { "Idempotent-Replay": "true" }));
+    const started = performance.now();
+    const created = await client({ fetch: impl }).tasks.create({
+      model: "m",
+      input: {},
+      idempotencyKey: "key-unreadable-409",
+    });
+    assert.equal(created.taskId, "first");
+    assert.equal(created.idempotentReplay, true);
+    assert.equal(callCount, 2);
+    const elapsed = performance.now() - started;
+    // The exponential-backoff fallback (used if Retry-After were ignored)
+    // starts at 500ms — comfortably distinguishable from the ~1000ms this
+    // Retry-After should have produced.
+    assert.ok(elapsed >= 800, `should have waited close to the Retry-After delay, got ${elapsed}ms`);
   });
 });
 

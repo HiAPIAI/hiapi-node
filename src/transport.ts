@@ -250,7 +250,7 @@ export class Transport {
           }
           knownStatus = resp.status;
           knownHeaders = resp.headers;
-          rawText = await safeText(resp, attemptSignal);
+          rawText = await resp.text();
         } catch (err) {
           // decodeJson signals malformed 2xx bodies with an APIError — that is a
           // final answer from the server, not a network failure; never retry it.
@@ -271,30 +271,47 @@ export class Transport {
             throw opts.signal!.reason ?? new DOMException("This operation was aborted", "AbortError");
           }
           // A non-2xx status was already known — headers had arrived —
-          // before THIS failure (the body read itself timing out) happened.
-          // If that status is one this SDK retries UNCONDITIONALLY (429/503,
-          // regardless of method or idempotency — the server rejected the
-          // request before processing), honour that using the Retry-After
-          // header already captured, rather than falling into the
-          // network-error gate below: for a keyless POST, that gate is
-          // `false`, so a body-read timeout on an ALREADY-KNOWN, always-
-          // retryable 429/503 would otherwise surface as an unretried
-          // APIConnectionError, silently discarding a retry the known status
-          // alone already made safe — confirmed by reproducing a keyless
-          // POST's 429 going unretried at maxRetries=1 when its own body
-          // read timed out.
-          if (
-            knownStatus !== undefined &&
-            RETRY_STATUSES.has(knownStatus) &&
-            attempt < this.maxRetries
-          ) {
-            await sleep(retryDelayMs(attempt, knownHeaders ?? null), opts.signal);
-            attempt += 1;
-            continue;
+          // before THIS failure (reading the body itself, for ANY reason:
+          // the per-attempt timeout firing mid-read, or a genuine stream
+          // error unrelated to any signal) happened. Losing the READABLE
+          // BODY doesn't mean losing the STATUS too:
+          // - 429/503 are retried UNCONDITIONALLY regardless of method or
+          //   idempotency (the server rejected the request before
+          //   processing) — falling into the network-error gate below
+          //   instead would, for a keyless POST (where that gate is
+          //   `false`), silently discard a retry the known status alone
+          //   already made safe (confirmed by reproducing a keyless POST's
+          //   429 going unretried at maxRetries=1 when its own body read
+          //   timed out).
+          // - A 409 with an idempotency key is safe to retry even without
+          //   confirming it was specifically IDEMPOTENCY_KEY_PROCESSING
+          //   (as opposed to IDEMPOTENCY_KEY_MISMATCH) — a keyed request
+          //   never creates a second task on retry either way, and refusing
+          //   to retry just because the body happened to be unreadable
+          //   surfaced a misleadingly generic error instead of a real
+          //   chance at the safe replay path (confirmed by reproducing a
+          //   409 whose body read failed for a non-abort reason skipping
+          //   this retry entirely, unlike the otherwise-identical case
+          //   where the body read had succeeded).
+          if (knownStatus !== undefined) {
+            const retryableKnownStatus =
+              RETRY_STATUSES.has(knownStatus) || (hasIdempotencyKey && knownStatus === 409);
+            if (retryableKnownStatus && attempt < this.maxRetries) {
+              await sleep(retryDelayMs(attempt, knownHeaders ?? null), opts.signal);
+              attempt += 1;
+              continue;
+            }
+            // Not retryable, or retries exhausted — still a definite,
+            // status-aware error (e.g. ServiceUnavailableError), not the
+            // ambiguous APIConnectionError below: there's simply no body to
+            // include, since that's what failed to read.
+            throw errorFromResponse(knownStatus, "");
           }
           // Anything else fetch throws is network-level: DNS, refused/reset
-          // connections, TLS failures, or the per-attempt timeout firing.
-          // Only retry when the request is safe to repeat (see gate above).
+          // connections, TLS failures, or the per-attempt timeout firing —
+          // and no status was ever established at all (the fetch call
+          // itself is what failed). Only retry when the request is safe to
+          // repeat (see gate above).
           if (retryOnNetworkError && attempt < this.maxRetries) {
             await sleep(retryDelayMs(attempt, null), opts.signal);
             attempt += 1;
@@ -509,30 +526,6 @@ function describeError(err: unknown): string {
     return String(err);
   } catch {
     return `<un-stringifiable ${typeof err}>`;
-  }
-}
-
-/**
- * Reads a non-2xx response body, tolerating a body that's malformed or
- * unreadable for reasons unrelated to cancellation (still try to surface
- * SOME status-mapped error rather than crash). NOT tolerant of `signal`
- * itself being the reason the read failed: swallowing that too — an earlier
- * revision did — let an abort or per-attempt timeout landing mid-body-read
- * silently turn into a normal (wrong) status-mapped error instead of
- * surfacing as the cancellation it actually was (confirmed by reproducing
- * an abort during a pending 404 body read producing `NotFoundError` while
- * `signal.aborted` was already `true`). Re-throwing here hands the failure
- * back to the caller's own catch block, which already distinguishes a
- * caller abort from a retryable timeout correctly.
- */
-async function safeText(resp: Response, signal: AbortSignal): Promise<string> {
-  try {
-    return await resp.text();
-  } catch (err) {
-    if (signal.aborted) {
-      throw err;
-    }
-    return "";
   }
 }
 
