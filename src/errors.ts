@@ -23,9 +23,26 @@
 
 import type { Task } from "./models.js";
 
+/**
+ * Structurally identical to the built-in `ErrorOptions` (`{ cause?: unknown }`),
+ * defined locally instead of referencing that global type directly. `ErrorOptions`
+ * is only declared by TypeScript's ES2022 lib — a consumer project compiling
+ * against an older `lib` (ES2020/ES2021, common for Node 18 targets) has no
+ * global of that name in scope, and since our public `.d.ts` output would
+ * otherwise reference it unqualified, TS reports `TS2552: Cannot find name
+ * 'ErrorOptions'` on every constructor that exposes it — confirmed by compiling
+ * the built `dist/esm/errors.d.ts` under `"lib": ["ES2020", "DOM"]`. Our own
+ * runtime `target`/`lib` stay ES2022 (verified structurally compatible via
+ * TS's structural typing when passed to `super(message, options)`); only the
+ * publicly-exported parameter type changes.
+ */
+export interface CauseOptions {
+  cause?: unknown;
+}
+
 /** Base class for every error thrown by the SDK. */
 export class HiAPIError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
+  constructor(message: string, options?: CauseOptions) {
     super(message, options);
     this.name = "HiAPIError";
   }
@@ -160,7 +177,7 @@ export class IdempotencyKeyMismatchError extends APIError {
 
 /** A network-level failure (or client-side timeout) prevented the request from completing. */
 export class APIConnectionError extends HiAPIError {
-  constructor(message: string, options?: ErrorOptions) {
+  constructor(message: string, options?: CauseOptions) {
     super(message, options);
     this.name = "APIConnectionError";
   }
@@ -218,7 +235,7 @@ export class PollTimeoutError extends HiAPIError {
 export class RunAbortedError extends HiAPIError {
   readonly taskId: string;
 
-  constructor(taskId: string, options?: ErrorOptions) {
+  constructor(taskId: string, options?: CauseOptions) {
     super(
       `run() was aborted after task ${taskId} was already created — it may ` +
         `still run and bill; poll tasks.retrieve("${taskId}") to check on it`,

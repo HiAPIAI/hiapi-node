@@ -1,16 +1,35 @@
 name: Publish to npm
 
+# Triggered by pushes landing on main — NOT by an arbitrary `v*` tag push (the
+# earlier design). GitHub Actions runs a workflow using the file content AT
+# THE REF THAT TRIGGERED THE EVENT: for a tag push, that's whatever
+# publish.yml exists at the TAGGED COMMIT, not main's reviewed copy. A
+# contributor who can push a tag (but not merge to main) could therefore tag
+# a side commit carrying a modified copy of this very file — e.g. with the
+# HEAD-equality check that used to live here deleted — and it would still
+# run with this repo's NPM_TOKEN and id-token:write. That check was
+# self-referential: it lived in the same untrusted file it was meant to
+# gate. `push: branches: [main]` closes this because the workflow definition
+# that executes is always whatever landed on main itself, which (assuming
+# main is protected and requires review to push to) is the actual trust
+# boundary — there's no ref for an attacker to point at that runs a
+# different copy of this file. Publishing then happens automatically
+# whenever package.json's version on main has no matching git tag yet; the
+# release tag is created AFTER a successful publish, as a record, not as
+# the trigger.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: read
-  id-token: write # npm --provenance attestation
 
 jobs:
-  publish:
+  check:
     runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,39 +37,37 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-      - name: Verify the tag points at main's current HEAD
-        # A tag matching v* is enough to trigger this workflow regardless of
-        # which commit it points to — checking out that ref alone doesn't
-        # prove it's part of main's reviewed history. An earlier revision of
-        # this check only required the tagged commit to be SOME ancestor of
-        # main, not main's actual current HEAD — this repo's own history
-        # makes that gap concrete: package.json's version has stayed 0.2.1
-        # across every commit so far, so tagging any older commit as v0.2.1
-        # would pass an ancestor-only check AND the version check below,
-        # publishing stale, unpatched code under the version string of the
-        # actual, fully-fixed release. Requiring an EXACT match to main's
-        # current tip closes that: it also means an account with push (tag)
-        # access but no merge access to main can't publish an arbitrary,
-        # unreviewed commit — one that could also modify prepack/test and
-        # touch NPM_TOKEN during npm publish.
+      - id: check
+        name: Check whether this version was already released
         run: |
-          git fetch origin main
-          main_head="$(git rev-parse origin/main)"
-          if [ "$GITHUB_SHA" != "$main_head" ]; then
-            echo "::error::tagged commit $GITHUB_SHA is not origin/main's current HEAD ($main_head) — refusing to publish a stale or unreviewed commit"
-            exit 1
-          fi
-      - run: npm ci
-      - name: Verify tag matches package.json version
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
           pkg="$(node -p "require('./package.json').version")"
-          if [ "$tag" != "$pkg" ]; then
-            echo "::error::tag v$tag does not match package.json version $pkg — refusing to publish a mismatched, immutable npm release"
-            exit 1
+          if git rev-parse -q --verify "refs/tags/v$pkg" >/dev/null; then
+            echo "v$pkg is already tagged — skipping publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "version=$pkg" >> "$GITHUB_OUTPUT"
           fi
+
+  publish:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to push the release tag after a successful publish
+      id-token: write # npm --provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
       - run: npm test
       - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Tag the release
+        run: |
+          git tag "v${{ needs.check.outputs.version }}"
+          git push origin "v${{ needs.check.outputs.version }}"

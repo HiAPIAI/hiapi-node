@@ -168,6 +168,44 @@ try {
   writeFileSync(join(dir, "consumer-cjs.cts"), CONSUMER_SOURCE);
   execFileSync(process.execPath, [...tscArgs, "consumer-cjs.cts"], { cwd: dir, stdio: "pipe" });
 
+  // (c) A consumer compiling against an OLDER `lib` (ES2020, no ES2022) with
+  // skipLibCheck DISABLED. (a)/(b) above pass --skipLibCheck, which
+  // (deliberately, for those checks) skips type-checking .d.ts files
+  // entirely — so neither would ever catch a public constructor referencing
+  // a global type only ES2022's lib declares. This one leaves skipLibCheck
+  // off specifically to check the shipped .d.ts files themselves, under a
+  // lib/target combination a real Node-18-targeting project would plausibly
+  // use. Confirmed via a real repro that this failed with
+  // `TS2552: Cannot find name 'ErrorOptions'` at all three constructors
+  // below before the SDK stopped referencing the bare global `ErrorOptions`
+  // (an ES2022-only lib type) in its public API.
+  const ERROR_CONSUMER_SOURCE = `
+import { HiAPIError, APIConnectionError, RunAbortedError } from "hiapi";
+
+new HiAPIError("x", { cause: new Error("y") });
+new APIConnectionError("x", { cause: new Error("y") });
+new RunAbortedError("task_1", { cause: new Error("y") });
+`;
+  writeFileSync(join(dir, "consumer-old-lib.ts"), ERROR_CONSUMER_SOURCE);
+  execFileSync(
+    process.execPath,
+    [
+      TSC_JS,
+      "--noEmit",
+      "--strict",
+      "--module",
+      "nodenext",
+      "--moduleResolution",
+      "nodenext",
+      "--target",
+      "es2020",
+      "--lib",
+      "es2020,dom",
+      "consumer-old-lib.ts",
+    ],
+    { cwd: dir, stdio: "pipe" },
+  );
+
   console.log('smoke:types ok — both exports map "types" conditions resolve for a real npm install');
 } finally {
   rmSync(dir, { recursive: true, force: true });
