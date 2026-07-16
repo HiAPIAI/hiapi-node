@@ -48,6 +48,7 @@ export {
   TaskFailedError,
   PollTimeoutError,
   RunAbortedError,
+  RunFailedError,
   WebhookVerificationError,
 } from "./errors.js";
 

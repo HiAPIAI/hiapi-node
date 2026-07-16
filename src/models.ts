@@ -214,10 +214,19 @@ export class TaskPage {
     this.raw = fields.raw ?? {};
   }
 
-  static fromJSON(d: JSONObject): TaskPage {
+  /**
+   * @param d The value to extract items/page/size/total from — usually the
+   *   response's `data` field (or a substitute, if `data` itself was
+   *   missing/malformed).
+   * @param raw What `.raw` holds; defaults to `d`. Callers that have the
+   *   full response envelope on hand (not just `data`) should pass it here
+   *   instead, so `.raw` reflects everything the server actually sent —
+   *   including sibling top-level fields, and the real payload if the
+   *   server's shape drifts away from `data` entirely.
+   */
+  static fromJSON(d: JSONObject, raw: JSONObject = d): TaskPage {
     // The API returns the page array under "tasks"; accept common alternates
-    // too so a paginated list never silently parses to empty. The full
-    // payload is kept in raw.
+    // too so a paginated list never silently parses to empty.
     let rawItems: unknown[] | undefined;
     for (const key of ["tasks", "items", "list", "data", "records"]) {
       const value = d[key];
@@ -232,7 +241,7 @@ export class TaskPage {
       page: optNum(d.page),
       size: optNum(d.size),
       total: optNum(d.total),
-      raw: d,
+      raw,
     });
   }
 }

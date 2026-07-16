@@ -16,7 +16,8 @@
  *     ├── APIConnectionError           network failure / DNS / connection reset / timeout
  *     ├── TaskFailedError              a polled task reached terminal status=fail
  *     ├── PollTimeoutError             run()/wait() exceeded the client-side timeout
- *     ├── RunAbortedError              run()'s signal was aborted after task creation
+ *     ├── RunAbortedError              run()'s signal was aborted immediately after task creation
+ *     ├── RunFailedError               run()'s task exists but failed some other way while polling
  *     └── WebhookVerificationError     callback signature / timestamp check failed
  */
 
@@ -198,10 +199,11 @@ export class PollTimeoutError extends HiAPIError {
 /**
  * `run()`'s `signal` was already aborted — either before `create()` was
  * called, or while it was in flight — by the time the task had actually been
- * created. Distinct from the plain `AbortError` thrown for an abort during
- * `wait()`'s polling (there is no task to lose track of in that case): the
- * task here does exist and may still run and bill, so this carries `taskId`
- * so the caller isn't left unable to find it.
+ * created. See {@link RunFailedError} for every other way `run()` can fail
+ * once its task exists (a later abort, a network/API error while polling, an
+ * `onUpdate` rejection): both carry `taskId` for the same reason — the task
+ * exists and may still run and bill, so the caller must not be left unable
+ * to find it.
  */
 export class RunAbortedError extends HiAPIError {
   readonly taskId: string;
@@ -213,6 +215,35 @@ export class RunAbortedError extends HiAPIError {
       options,
     );
     this.name = "RunAbortedError";
+    this.taskId = taskId;
+  }
+}
+
+/**
+ * `run()`'s task was created, but something other than a terminal `fail`
+ * status or a client-side poll timeout kept it from finishing — a network or
+ * API error while polling, an `onUpdate` callback rejecting, or the `signal`
+ * aborting during (rather than immediately after) creation. Those errors
+ * (`APIConnectionError`, `APIError` and subclasses, an arbitrary rejection,
+ * a plain `AbortError`) don't carry a `taskId` of their own, and the task
+ * this error is about already exists and may still run and bill — this
+ * wraps whichever of them occurred as `cause` and exposes `taskId` so the
+ * caller can still look the task up. `TaskFailedError` and
+ * `PollTimeoutError` are NOT wrapped this way: both already carry `taskId`
+ * (via `.task.taskId` and `.taskId` respectively) and are still thrown
+ * directly, unchanged.
+ */
+export class RunFailedError extends HiAPIError {
+  readonly taskId: string;
+
+  constructor(taskId: string, cause: unknown) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    super(
+      `run() failed for task ${taskId} after it was created: ${reason} — it ` +
+        `may still run and bill; poll tasks.retrieve("${taskId}") to check on it`,
+      { cause },
+    );
+    this.name = "RunFailedError";
     this.taskId = taskId;
   }
 }

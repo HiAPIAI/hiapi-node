@@ -129,7 +129,19 @@ export class Transport {
     // here, at the single point every caller's request funnels through, so a
     // future resource can't reintroduce the "retries a non-idempotent POST"
     // risk by skipping this check the way a per-caller trim would allow.
-    const idempotencyKey = opts.extraHeaders?.[IDEMPOTENCY_KEY_HEADER]?.trim();
+    //
+    // Only ASCII space/tab are trimmed here — NOT `String.prototype.trim()`,
+    // which strips a much wider Unicode whitespace set (including NBSP,
+    // U+00A0) than HTTP's own OWS (RFC 7230: SP/HTAB only). Trimming with the
+    // former let a non-ASCII character sneak past the ASCII-range check
+    // below entirely: confirmed via `node -e` that `" ".trim()` (an NBSP-only key)
+    // is `""` — silently treated as "no key" — and that
+    // `" abc ".trim()` is `"abc"`, rewriting a caller's actual key
+    // to a different, shorter one before validation ever saw the NBSP.
+    const idempotencyKey = opts.extraHeaders?.[IDEMPOTENCY_KEY_HEADER]?.replace(
+      /^[ \t]+|[ \t]+$/g,
+      "",
+    );
     const hasIdempotencyKey = Boolean(idempotencyKey);
     if (idempotencyKey) {
       // Fetch header values are ByteString (Latin-1 only): a character

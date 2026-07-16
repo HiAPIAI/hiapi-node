@@ -308,6 +308,27 @@ describe("idempotencyKey validation", () => {
     await client().tasks.create({ model: "m", input: {}, idempotencyKey: key });
     assert.equal(mock.requests[0].headers["idempotency-key"], key);
   });
+
+  test("NBSP doesn't bypass ASCII validation the way String.prototype.trim() would let it", async () => {
+    // `String.prototype.trim()` strips a much wider Unicode whitespace set
+    // than HTTP's own OWS (RFC 7230: SP/HTAB only) — including NBSP,
+    // U+00A0 — confirmed via `node -e` that `" ".trim() === ""` and
+    // `" abc ".trim() === "abc"`. An earlier revision validated
+    // the *trimmed* value, so an NBSP-only key silently became "no key",
+    // and an NBSP-padded key was silently rewritten to a shorter, different
+    // ASCII key than the one actually passed in.
+    await assert.rejects(
+      client().tasks.create({ model: "m", input: {}, idempotencyKey: " " }),
+      RangeError,
+    );
+    assert.equal(mock.requests.length, 0);
+
+    await assert.rejects(
+      client().tasks.create({ model: "m", input: {}, idempotencyKey: " abc " }),
+      RangeError,
+    );
+    assert.equal(mock.requests.length, 0);
+  });
 });
 
 describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {

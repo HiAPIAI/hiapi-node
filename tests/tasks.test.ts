@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
 
 import {
+  APIConnectionError,
   HiAPI,
   HiAPIError,
   PollTimeoutError,
   RunAbortedError,
+  RunFailedError,
   TaskFailedError,
 } from "../src/index.js";
 import { jsonReply, startMock, type MockServer } from "./_server.js";
@@ -236,6 +238,34 @@ describe("tasks.list", () => {
       assert.deepEqual(page.raw, { data: malformed }, `malformed=${JSON.stringify(malformed)}`);
     }
   });
+
+  test(".raw is the full response envelope, not just the data field", async () => {
+    // A sibling top-level field alongside `data` (e.g. a trace id) — an
+    // earlier revision passed only `env.data` through, discarding this
+    // entirely even in the ordinary, non-malformed case.
+    mock.reset(() =>
+      jsonReply({ data: { tasks: [{ taskId: "a", model: "m", status: "success" }] }, traceId: "trace-1" }),
+    );
+    const page = await client().tasks.list();
+    assert.equal(page.items[0].taskId, "a");
+    assert.deepEqual(page.raw, {
+      data: { tasks: [{ taskId: "a", model: "m", status: "success" }] },
+      traceId: "trace-1",
+    });
+  });
+
+  test(".raw keeps the real payload even when the server's shape drifts away from `data` entirely", async () => {
+    // A full protocol-drift scenario: the task list moved to a differently
+    // named top-level key instead of `data`. items can't be recovered (the
+    // parser only recognizes specific key names), but `.raw` must still
+    // show the real, complete payload the server sent — not an empty `{}` —
+    // so a caller diagnosing "why are there no items" isn't left with
+    // nothing to go on.
+    mock.reset(() => jsonReply({ payload: { tasks: [{ taskId: "z" }] }, traceId: "trace-2" }));
+    const page = await client().tasks.list();
+    assert.deepEqual(page.items, []);
+    assert.deepEqual(page.raw, { payload: { tasks: [{ taskId: "z" }] }, traceId: "trace-2" });
+  });
 });
 
 describe("tasks.wait", () => {
@@ -288,6 +318,60 @@ describe("tasks.wait", () => {
       }),
       (err: unknown) => err === boom,
     );
+  });
+
+  test("a hanging (never-settling) onUpdate doesn't block wait() past the deadline", async () => {
+    mock.reset(() => statusReply("queued"));
+    const started = performance.now();
+    await assert.rejects(
+      client().tasks.wait("w1", {
+        pollIntervalMs: 10,
+        timeoutMs: 30,
+        onUpdate: () => new Promise<void>(() => {}),
+      }),
+      PollTimeoutError,
+    );
+    assert.ok(performance.now() - started < 5_000);
+  });
+
+  test("an AbortSignal fired during a hanging onUpdate is honoured promptly, not blocked until it settles", async () => {
+    mock.reset(() => statusReply("queued"));
+    const controller = new AbortController();
+    const started = performance.now();
+    const waiting = client().tasks.wait("w1", {
+      pollIntervalMs: 60_000,
+      timeoutMs: 120_000,
+      signal: controller.signal,
+      onUpdate: () => new Promise<void>(() => {}),
+    });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(waiting, (err: unknown) => {
+      assert.equal((err as Error).name, "AbortError");
+      return true;
+    });
+    assert.ok(performance.now() - started < 5_000);
+  });
+
+  test("an abort landing right as a terminal-status onUpdate finishes is still honoured, not overridden by the stale success", async () => {
+    mock.reset(() => statusReply("success"));
+    const controller = new AbortController();
+    const waiting = client().tasks.wait("w1", {
+      pollIntervalMs: 60_000,
+      timeoutMs: 120_000,
+      signal: controller.signal,
+      onUpdate: () =>
+        new Promise<void>((resolve) => {
+          // Aborts while this call is still pending, then resolves
+          // normally right after — proving the abort wins even though
+          // onUpdate itself completed without ever rejecting.
+          controller.abort();
+          setTimeout(resolve, 5);
+        }),
+    });
+    await assert.rejects(waiting, (err: unknown) => {
+      assert.equal((err as Error).name, "AbortError");
+      return true;
+    });
   });
 
   test("terminal fail throws TaskFailedError carrying the task and code", async () => {
@@ -506,5 +590,99 @@ describe("tasks.run", () => {
       },
     );
     assert.equal(mock.requests.length, 1);
+  });
+
+  test("an invalid pollIntervalMs is rejected before create() ever fires — no POST is sent", async () => {
+    // wait()'s own validation runs too late to help here: it only ran once
+    // wait() itself was reached, well after create() had already fired (and
+    // potentially billed) the task run() then had no way to poll for.
+    await assert.rejects(
+      client().tasks.run({ model: "m", input: {}, pollIntervalMs: 0 }),
+      RangeError,
+    );
+    assert.equal(mock.requests.length, 0);
+  });
+
+  test("a network error while polling is wrapped in RunFailedError carrying the taskId", async () => {
+    mock.reset(() => jsonReply({ data: { taskId: "r3" } }));
+    const flakyClient = new HiAPI({
+      apiKey: "sk-test",
+      baseUrl: mock.url,
+      timeoutMs: 5_000,
+      maxRetries: 0,
+      fetch: async (input, init) => {
+        // First call is create()'s POST — let it through normally; anything
+        // after (wait()'s first retrieve()) fails as a network error.
+        if (mock.requests.length > 0) {
+          throw new TypeError("fetch failed");
+        }
+        return fetch(input, init);
+      },
+    });
+    await assert.rejects(
+      flakyClient.tasks.run({ model: "m", input: {}, pollIntervalMs: 1 }),
+      (err: unknown) => {
+        assert.ok(err instanceof RunFailedError);
+        assert.equal(err.taskId, "r3");
+        assert.ok(err.cause instanceof APIConnectionError);
+        assert.match(err.message, /r3/);
+        return true;
+      },
+    );
+  });
+
+  test("a rejecting onUpdate during run() is wrapped in RunFailedError carrying the taskId", async () => {
+    mock.reset((_req, index) =>
+      index === 0
+        ? jsonReply({ data: { taskId: "r4" } })
+        : jsonReply({ data: { taskId: "r4", model: "m", status: "queued" } }),
+    );
+    const boom = new Error("onUpdate boom");
+    await assert.rejects(
+      client().tasks.run({
+        model: "m",
+        input: {},
+        pollIntervalMs: 1,
+        onUpdate: () => {
+          throw boom;
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RunFailedError);
+        assert.equal(err.taskId, "r4");
+        assert.equal(err.cause, boom);
+        return true;
+      },
+    );
+  });
+
+  test("TaskFailedError and PollTimeoutError from wait() are NOT wrapped — they already carry the taskId", async () => {
+    mock.reset((_req, index) =>
+      index === 0
+        ? jsonReply({ data: { taskId: "r5" } })
+        : jsonReply({ data: { taskId: "r5", model: "m", status: "fail" } }),
+    );
+    await assert.rejects(
+      client().tasks.run({ model: "m", input: {}, pollIntervalMs: 1 }),
+      (err: unknown) => {
+        assert.ok(err instanceof TaskFailedError);
+        assert.equal(err.task.taskId, "r5");
+        return true;
+      },
+    );
+
+    mock.reset((_req, index) =>
+      index === 0
+        ? jsonReply({ data: { taskId: "r6" } })
+        : jsonReply({ data: { taskId: "r6", model: "m", status: "queued" } }),
+    );
+    await assert.rejects(
+      client().tasks.run({ model: "m", input: {}, pollIntervalMs: 10, timeoutMs: 30 }),
+      (err: unknown) => {
+        assert.ok(err instanceof PollTimeoutError);
+        assert.equal(err.taskId, "r6");
+        return true;
+      },
+    );
   });
 });

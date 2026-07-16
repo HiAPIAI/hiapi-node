@@ -1,6 +1,12 @@
 /** The `client.tasks` resource — the unified async task API (/v1/tasks). */
 
-import { HiAPIError, PollTimeoutError, RunAbortedError, TaskFailedError } from "./errors.js";
+import {
+  HiAPIError,
+  PollTimeoutError,
+  RunAbortedError,
+  RunFailedError,
+  TaskFailedError,
+} from "./errors.js";
 import { CreatedTask, Task, TaskPage } from "./models.js";
 import type { JSONObject } from "./models.js";
 import { IDEMPOTENCY_KEY_HEADER, MAX_TIMER_DELAY_MS, sleep, Transport } from "./transport.js";
@@ -83,11 +89,14 @@ export interface WaitOptions {
    * both, since TS's "ignore the return value" rule for a `void`-typed
    * callback already covers a `Promise` too). Passing an `async` function
    * therefore still type-checks with no ceremony, and at runtime it's
-   * actually awaited: a slow one delays the next poll rather than racing
-   * it, and a rejection propagates out of `wait()`/`run()` instead of
-   * becoming an unhandled promise rejection (confirmed: without awaiting,
-   * two status changes firing back-to-back could have their callbacks
-   * settle out of order).
+   * actually awaited: a rejection propagates out of `wait()`/`run()` instead
+   * of becoming an unhandled promise rejection, and two status changes
+   * firing back-to-back settle in order rather than racing (confirmed by
+   * reproducing both without awaiting). The wait, in turn, is itself raced
+   * against `signal` and the remaining `timeoutMs` budget — a hanging
+   * (never-settling) `onUpdate` doesn't block `wait()` past either one
+   * (confirmed by reproducing exactly that with a callback that never
+   * resolves).
    */
   onUpdate?: (task: Task) => void;
   /**
@@ -189,15 +198,22 @@ export class Tasks {
       d = rawData as JSONObject;
     } else {
       // Neither an array nor an object (null, a string, a number, a
-      // boolean): TaskPage.fromJSON needs a JSONObject to extract items
-      // from, but wrapping the true value here — instead of discarding it
-      // as `{}` the way an earlier revision did — keeps it visible on
-      // `.raw`, so a caller can still tell a genuinely empty page apart
-      // from the server (or a proxy in between) sending something
-      // malformed. See TaskPage's own doc comment on `.raw`.
-      d = { data: rawData };
+      // boolean) — TaskPage.fromJSON needs a JSONObject to extract items
+      // from; `.raw` below is what actually preserves it for diagnosis, not
+      // this substitute.
+      d = {};
     }
-    return TaskPage.fromJSON(d);
+    // `.raw` is the full response envelope, not just `env.data` — an earlier
+    // revision passed only the (possibly-substituted) `data` value through,
+    // so a sibling top-level field (e.g. a trace id) sent alongside `data`
+    // was silently discarded, and if the server's shape drifted entirely
+    // (the task list moved to a differently-named top-level key instead of
+    // `data`) the real payload was lost along with it — confirmed by
+    // reproducing both `{data:null,traceId:"..."}` and
+    // `{payload:{tasks:[...]},traceId:"..."}` against the earlier version.
+    // Passing `env` itself means `.raw` always matches what TaskPage's own
+    // doc comment already promised.
+    return TaskPage.fromJSON(d, env);
   }
 
   /**
@@ -218,34 +234,7 @@ export class Tasks {
   async wait(taskId: string, options: WaitOptions = {}): Promise<Task> {
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const timeoutMs = options.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
-    // Inverted comparisons (rather than `<= 0` / `< 0`) so a NaN value fails
-    // the check too — a bare `NaN <= 0` is `false`, which would otherwise let
-    // NaN slip through and turn the loop below into a zero-delay busy poll.
-    // pollIntervalMs must additionally be finite and within Node's real timer
-    // range (unlike timeoutMs, which may be Infinity to mean "no timeout"):
-    // confirmed via `node -e` that both `Infinity` and values above
-    // MAX_TIMER_DELAY_MS get silently clamped to ~1ms rather than waited out
-    // in full, which would turn a large/infinite interval into the same
-    // zero-delay busy-poll NaN causes.
-    if (
-      !Number.isFinite(pollIntervalMs) ||
-      !(pollIntervalMs > 0) ||
-      pollIntervalMs > MAX_TIMER_DELAY_MS
-    ) {
-      throw new RangeError(`pollIntervalMs must be a finite number in (0, ${MAX_TIMER_DELAY_MS}]`);
-    }
-    // `typeof` first, not `Number.isFinite` (which would also reject the
-    // legitimate `Infinity` value): a bare `>= 0` comparison coerces a
-    // non-number — e.g. a plain-JS caller (no compile-time protection)
-    // passing the STRING "Infinity" — since `"Infinity" >= 0` reads as
-    // `Number("Infinity") >= 0` and passes, but `deadline + timeoutMs` below
-    // uses `+`, which for a string operand does concatenation instead of
-    // addition, producing a garbage value that later coerces to NaN and
-    // reproduces the exact zero-delay busy-poll this function guards against
-    // elsewhere. Confirmed by tracing the actual `+`/`-` coercion rules.
-    if (typeof timeoutMs !== "number" || Number.isNaN(timeoutMs) || timeoutMs < 0) {
-      throw new RangeError("timeoutMs must be a number >= 0");
-    }
+    validateWaitOptions(pollIntervalMs, timeoutMs);
     const deadline = performance.now() + timeoutMs;
     let lastStatus: string | undefined;
     for (;;) {
@@ -258,7 +247,15 @@ export class Tasks {
       options.signal?.throwIfAborted();
       if (options.onUpdate && task.status !== lastStatus) {
         lastStatus = task.status;
-        await options.onUpdate(task);
+        await raceOnUpdate(options.onUpdate(task), options.signal, taskId, timeoutMs, deadline);
+        // Re-checked once more: onUpdate settling normally doesn't itself
+        // prove the signal wasn't aborted in the same tick it resolved —
+        // without this, an abort landing right as a terminal-status
+        // onUpdate call finishes could still fall through to `return task`
+        // below (confirmed by reproducing exactly that: an abort fired
+        // during a "success" onUpdate still returned the stale success
+        // result instead of the abort).
+        options.signal?.throwIfAborted();
       }
       if (task.status === "success") {
         return task;
@@ -283,27 +280,153 @@ export class Tasks {
    * optional and independent of polling; set it if you also want a webhook.
    *
    * `signal` is checked before `create()` is ever called and again right
-   * after — `create()` has no signal awareness of its own (there is no
-   * in-flight request to cancel; a `POST /tasks` is not safe to abandon
-   * mid-flight since it may already have billed), so without both checks an
-   * already-aborted `signal` would still let the task get created, and an
-   * abort landing during creation would only surface once `wait()`'s own
-   * check ran — as a plain `AbortError` with no way to recover the `taskId`
-   * of the task that now exists. See {@link RunAbortedError}.
+   * after, and `pollIntervalMs`/`timeoutMs` are validated up front too —
+   * `create()` has no signal awareness of its own (there is no in-flight
+   * request to cancel; a `POST /tasks` is not safe to abandon mid-flight
+   * since it may already have billed), so without all of this an
+   * already-aborted `signal`, or a `wait()`-bound config mistake (e.g.
+   * `pollIntervalMs: 0`), would still let the task get created before ever
+   * discovering it can't actually be polled for. Once the task exists, every
+   * other way `run()` can fail (an abort landing later, a network/API error
+   * while polling, an `onUpdate` rejection) is wrapped in
+   * {@link RunFailedError} so the `taskId` is never lost — except
+   * `TaskFailedError` and `PollTimeoutError`, which already carry it and are
+   * re-thrown unchanged. See {@link RunAbortedError} for the immediate
+   * post-creation case.
    */
   async run(params: RunParams): Promise<Task> {
     params.signal?.throwIfAborted();
+    validateWaitOptions(
+      params.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      params.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS,
+    );
     const created = await this.create(params);
     if (params.signal?.aborted) {
       throw new RunAbortedError(created.taskId, { cause: params.signal.reason });
     }
-    return this.wait(created.taskId, {
-      pollIntervalMs: params.pollIntervalMs,
-      timeoutMs: params.timeoutMs,
-      onUpdate: params.onUpdate,
-      signal: params.signal,
-    });
+    try {
+      return await this.wait(created.taskId, {
+        pollIntervalMs: params.pollIntervalMs,
+        timeoutMs: params.timeoutMs,
+        onUpdate: params.onUpdate,
+        signal: params.signal,
+      });
+    } catch (err) {
+      if (err instanceof TaskFailedError || err instanceof PollTimeoutError) {
+        throw err;
+      }
+      throw new RunFailedError(created.taskId, err);
+    }
   }
+}
+
+/**
+ * Validates `wait()`'s own options with no side effects, so `run()` can call
+ * it *before* `create()` — a caller mistake here (or a bad dynamically-built
+ * config) must not still create, and possibly bill, a task the SDK then
+ * immediately discovers it cannot poll for.
+ */
+function validateWaitOptions(pollIntervalMs: number, timeoutMs: number): void {
+  // Inverted comparisons (rather than `<= 0` / `< 0`) so a NaN value fails
+  // the check too — a bare `NaN <= 0` is `false`, which would otherwise let
+  // NaN slip through and turn wait()'s loop into a zero-delay busy poll.
+  // pollIntervalMs must additionally be finite and within Node's real timer
+  // range (unlike timeoutMs, which may be Infinity to mean "no timeout"):
+  // confirmed via `node -e` that both `Infinity` and values above
+  // MAX_TIMER_DELAY_MS get silently clamped to ~1ms rather than waited out
+  // in full, which would turn a large/infinite interval into the same
+  // zero-delay busy-poll NaN causes.
+  if (
+    !Number.isFinite(pollIntervalMs) ||
+    !(pollIntervalMs > 0) ||
+    pollIntervalMs > MAX_TIMER_DELAY_MS
+  ) {
+    throw new RangeError(`pollIntervalMs must be a finite number in (0, ${MAX_TIMER_DELAY_MS}]`);
+  }
+  // `typeof` first, not `Number.isFinite` (which would also reject the
+  // legitimate `Infinity` value): a bare `>= 0` comparison coerces a
+  // non-number — e.g. a plain-JS caller (no compile-time protection)
+  // passing the STRING "Infinity" — since `"Infinity" >= 0` reads as
+  // `Number("Infinity") >= 0` and passes, but `deadline + timeoutMs` in
+  // wait() uses `+`, which for a string operand does concatenation instead
+  // of addition, producing a garbage value that later coerces to NaN and
+  // reproduces the exact zero-delay busy-poll this function guards against
+  // elsewhere. Confirmed by tracing the actual `+`/`-` coercion rules.
+  if (typeof timeoutMs !== "number" || Number.isNaN(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError("timeoutMs must be a number >= 0");
+  }
+}
+
+/**
+ * Awaits `onUpdate`'s result, but loses the race to whichever comes first:
+ * `signal` aborting, or `deadline` elapsing. A plain `await
+ * options.onUpdate(task)` does neither — it doesn't listen for the signal at
+ * all, and doesn't race the deadline either, so a hanging (never-settling)
+ * `onUpdate` — or merely one slower than the remaining budget — blocked
+ * `wait()` past both controls entirely (confirmed by reproducing exactly
+ * that: a never-settling callback stayed pending well past both an already-
+ * elapsed `timeoutMs` and a `signal` aborted during the call).
+ */
+function raceOnUpdate(
+  result: void | Promise<void>,
+  signal: AbortSignal | undefined,
+  taskId: string,
+  timeoutMs: number,
+  deadline: number,
+): Promise<void> {
+  const settledResult = Promise.resolve(result);
+  if (!signal && !Number.isFinite(deadline)) {
+    return settledResult;
+  }
+  // Checked synchronously up front, not just via the "abort" listener below:
+  // `signal` can already be aborted by the time this is called (e.g. the
+  // caller's own `onUpdate` triggers the abort synchronously, before this
+  // function ever runs) — the "abort" event only fires once, so registering
+  // a listener for it afterwards would never see it, and this call would
+  // otherwise just wait out the original promise instead of rejecting
+  // immediately.
+  if (signal?.aborted) {
+    return Promise.reject(
+      signal.reason ?? new DOMException("This operation was aborted", "AbortError"),
+    );
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    };
+    const onAbort = () => {
+      if (settled) return;
+      cleanup();
+      reject(signal!.reason ?? new DOMException("This operation was aborted", "AbortError"));
+    };
+    if (Number.isFinite(deadline)) {
+      const remainingMs = Math.max(0, Math.min(deadline - performance.now(), MAX_TIMER_DELAY_MS));
+      timer = setTimeout(() => {
+        if (settled) return;
+        cleanup();
+        reject(new PollTimeoutError(taskId, timeoutMs));
+      }, remainingMs);
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    settledResult.then(
+      (value) => {
+        if (settled) return;
+        cleanup();
+        resolve(value);
+      },
+      (err: unknown) => {
+        if (settled) return;
+        cleanup();
+        reject(err);
+      },
+    );
+  });
 }
 
 function data(env: JSONObject): JSONObject {

@@ -195,6 +195,7 @@ and a failed or crashed handler is simply redelivered.
 | `TaskFailedError` | a polled task ended in `status=fail` (carries `task` and `code`) |
 | `PollTimeoutError` | `run()`/`wait()` exceeded its timeout (carries `taskId`) |
 | `RunAbortedError` | `run()`'s `signal` was aborted right after its task was created (carries `taskId` — the task exists and may still bill) |
+| `RunFailedError` | `run()`'s task exists but failed some other way while polling — network/API error, an `onUpdate` rejection, a later abort (carries `taskId` and the original error as `cause`) |
 | `WebhookVerificationError` | bad signature or stale timestamp |
 
 429/503 are retried automatically with exponential backoff (`maxRetries`,

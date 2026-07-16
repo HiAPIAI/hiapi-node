@@ -20,9 +20,9 @@
 // `CreateTaskParams`-typed variable — see tests/tasks.test.ts's "named
 // interface" test for the runtime half of that same regression check.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // `.pathname`, not used here on purpose: it keeps percent-encoding (e.g. a
@@ -37,27 +37,60 @@ const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
 // string without shell-safe quoting, so a path containing a space, common on
 // Windows, would be split into two arguments instead of staying intact).
 const TSC_JS = join(PACKAGE_ROOT, "node_modules/typescript/lib/tsc.js");
-// `npm` itself has no local JS entry point to fall back on the same way; on
-// Windows it's genuinely only reachable as `npm.cmd`.
-const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
-
-// Node's own docs: ".bat and .cmd files are not executable on their own
-// without a terminal, and therefore cannot be launched using
-// child_process.execFile()" — so `execFileSync(NPM, args)` alone throws on
-// Windows. The docs' own recommended fix is spawning cmd.exe with `/c`, NOT
-// `shell: true` (Node deprecated passing an `args` array together with
-// `shell: true` as of v22.15.0/v23.11.0, precisely because that combination
-// does a naive, unsafe join rather than real shell-quoting). cmd.exe's `/c`
-// line reconstruction still isn't argv-safe for a value containing a space,
-// so anything that could contain one (a filesystem path) is individually
-// quoted here; every other argument passed to npm below is a hardcoded flag
-// with no spaces or shell metacharacters.
-function runNpm(args, options) {
-  if (process.platform !== "win32") {
-    return execFileSync(NPM, args, options);
+// npm ships bundled with Node itself, as a real JS entry point — just like
+// tsc above, this lets every npm call below go through `node` directly, with
+// argv passed as a genuine array and NO shell or command-line re-parsing of
+// any kind involved, so it's exempt from every quoting/escaping concern a
+// string-based invocation would have (paths containing spaces, `&`, `|`,
+// `^`, `%`, `<`, `>`, parens — all just inert characters in one argv slot).
+// `npm_execpath` (set by npm itself whenever it invokes a script — true for
+// this one, run via `npm test`/`npm run smoke`) is the most reliable source,
+// since it names the exact npm build already running; the relative-to-
+// `process.execPath` layouts below are the documented fallback for direct,
+// non-npm-run invocation (this script only needs them when developing it
+// standalone), covering both the POSIX layout (verified on this machine) and
+// the Windows one (`node_modules/npm/bin/npm-cli.js` sits next to node.exe
+// on an official Windows install, not under a sibling `lib/`).
+function resolveNpmCli() {
+  const fromEnv = process.env.npm_execpath;
+  if (fromEnv && existsSync(fromEnv)) {
+    return fromEnv;
   }
-  const quoted = args.map((a) => (a.includes(" ") ? `"${a}"` : a));
+  const nodeDir = dirname(process.execPath);
+  const candidates = [
+    join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
+    join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
+  return candidates.find(existsSync);
+}
+const NPM_CLI = resolveNpmCli();
+
+// Fallback for the rare install layout where no npm-cli.js is discoverable
+// at all: Node's own docs say ".bat and .cmd files are not executable on
+// their own without a terminal, and therefore cannot be launched using
+// child_process.execFile()" on Windows — spawning cmd.exe with `/c` is the
+// documented workaround, NOT `shell: true` (Node deprecated passing an
+// `args` array together with `shell: true` as of v22.15.0/v23.11.0,
+// precisely because that combination does a naive, unsafe join rather than
+// real shell-quoting). cmd.exe's own `/c` line reparsing is still not
+// argv-safe even with per-argument quoting (it separately treats `&`, `|`,
+// `^`, `%`, `<`, `>` and parens as special) — this path is a last resort,
+// not the primary mechanism, precisely because that can't be made fully
+// safe from here.
+function runNpmViaCmdExe(args, options) {
+  const NPM = "npm.cmd";
+  const quoted = args.map((a) => (/[\s&|^%<>()]/.test(a) ? `"${a}"` : a));
   return execFileSync("cmd.exe", ["/c", NPM, ...quoted], options);
+}
+
+function runNpm(args, options) {
+  if (NPM_CLI) {
+    return execFileSync(process.execPath, [NPM_CLI, ...args], options);
+  }
+  if (process.platform !== "win32") {
+    return execFileSync("npm", args, options);
+  }
+  return runNpmViaCmdExe(args, options);
 }
 
 const CONSUMER_SOURCE = `
