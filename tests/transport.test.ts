@@ -741,6 +741,80 @@ describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {
     );
   });
 
+  test("a keyed 409 whose body reads successfully but empty still retries as IDEMPOTENCY_KEY_PROCESSING", async () => {
+    // errorForUnreadableBody only covers resp.text() itself THROWING. A
+    // proxy/gateway stripping the real JSON body (or the body genuinely
+    // being empty) reaches errorFromResponse() successfully, but with no
+    // error_code to parse — falling through to a plain, unretried APIError
+    // the same way, for the same underlying reason. Confirmed by
+    // reproducing exactly that: an empty-body 409 on a keyed request was
+    // previously requested only once and thrown as plain APIError, even
+    // though the second attempt would have succeeded via the replay path.
+    let callCount = 0;
+    const impl: FetchLike = async (input, init) => {
+      callCount += 1;
+      if (callCount === 1) {
+        return {
+          ok: false,
+          status: 409,
+          headers: new Headers({ "Retry-After": "0" }),
+          text: () => Promise.resolve(""),
+        } as unknown as Response;
+      }
+      return fetch(input, init);
+    };
+    mock.reset(() => jsonReply({ data: { taskId: "first" } }, 200, { "Idempotent-Replay": "true" }));
+    const created = await client({ fetch: impl, maxRetries: 1 }).tasks.create({
+      model: "m",
+      input: {},
+      idempotencyKey: "key-empty-409-body",
+    });
+    assert.equal(created.taskId, "first");
+    assert.equal(created.idempotentReplay, true);
+    assert.equal(callCount, 2);
+  });
+
+  test("a keyed 422 whose body reads successfully but empty still surfaces IdempotencyKeyMismatchError", async () => {
+    const impl: FetchLike = async () =>
+      ({
+        ok: false,
+        status: 422,
+        headers: new Headers(),
+        text: () => Promise.resolve(""),
+      }) as unknown as Response;
+    await assert.rejects(
+      client({ fetch: impl, maxRetries: 0 }).tasks.create({
+        model: "m",
+        input: {},
+        idempotencyKey: "key-empty-422-body",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof IdempotencyKeyMismatchError);
+        assert.equal(err.status, 422);
+        return true;
+      },
+    );
+  });
+
+  test("a keyed 409 whose body DOES parse with a different, explicit error_code is trusted as-is, not overridden", async () => {
+    // The fix above only kicks in when errorCode is genuinely absent — an
+    // explicit, different error_code the body actually carries must not be
+    // silently replaced with an assumed IDEMPOTENCY_KEY_PROCESSING.
+    mock.reset(() => jsonReply({ error_code: "INVALID_REQUEST", message: "nope" }, 409));
+    await assert.rejects(
+      client({ maxRetries: 0 }).tasks.create({
+        model: "m",
+        input: {},
+        idempotencyKey: "key-conflicting-code",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.equal((err as APIError).errorCode, "INVALID_REQUEST");
+        return true;
+      },
+    );
+  });
+
   test("an unreadable, ambiguous status (e.g. 400) never guesses a specific subclass — plain APIError, cause preserved", async () => {
     // A single status can carry SEVERAL distinct business meanings (400 is
     // both INVALID_REQUEST and MODEL_UNAVAILABLE) — with no error_code to

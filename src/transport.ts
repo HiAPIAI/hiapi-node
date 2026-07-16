@@ -345,7 +345,34 @@ export class Transport {
           attempt += 1;
           continue;
         }
-        const err = errorFromResponse(status, rawText);
+        let err = errorFromResponse(status, rawText);
+        // `errorForUnreadableBody` above only covers the body-read itself
+        // THROWING. A 409/422 on a keyed POST /tasks whose body was
+        // readable but carried no recognizable error_code — empty,
+        // malformed JSON, or a proxy/gateway's own error page silently
+        // replacing the real body — falls through errorFromResponse() to a
+        // plain APIError the same way, for the same underlying reason
+        // (there's no error_code to key off), and needs the same fix: this
+        // endpoint's contract makes 409 ALWAYS IDEMPOTENCY_KEY_PROCESSING
+        // and 422 ALWAYS IDEMPOTENCY_KEY_MISMATCH, so an unparseable/empty
+        // body must not silently defeat the safe-retry/specific-class
+        // guarantee that gives (confirmed by reproducing a keyed POST's
+        // empty-body 409 surfacing as a plain, unretried APIError instead
+        // of retrying and succeeding on the next attempt). Only when
+        // `errorCode` is genuinely absent, though — if the body DID parse
+        // with some OTHER, explicit error_code, that's trusted as-is rather
+        // than overridden.
+        if (hasIdempotencyKey && err.errorCode === undefined) {
+          if (status === 409) {
+            err = new IdempotencyKeyProcessingError(err.message, {
+              status,
+              errorCode: IDEMPOTENCY_PROCESSING_CODE,
+              body: err.body,
+            });
+          } else if (status === 422) {
+            err = new IdempotencyKeyMismatchError(err.message, { status, body: err.body });
+          }
+        }
         // A 409 IDEMPOTENCY_KEY_PROCESSING means the first request with this
         // key is still in flight; honour Retry-After and retry — the next
         // attempt hits the replay path and returns the task.
