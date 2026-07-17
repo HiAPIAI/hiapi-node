@@ -625,21 +625,37 @@ function errorFromResponse(status: number, rawText: string): APIError {
 }
 
 /**
+ * Statuses whose meaning is fixed regardless of `error_code`: no code in
+ * `ERROR_CODE_TO_CLASS` is documented to occur at 401, 404, or 503, so
+ * `STATUS_TO_CLASS`'s fallback mapping for them is exactly as reliable as it
+ * is for a body that parsed fine but carried no/unrecognized `error_code` —
+ * safe to use even without a body to confirm it. 400 is deliberately
+ * excluded: it's the one status this API documents two distinct meanings
+ * for (`INVALID_REQUEST` and `MODEL_UNAVAILABLE`), so guessing a specific
+ * subclass for it from status alone could actually be wrong.
+ */
+const UNAMBIGUOUS_UNREADABLE_STATUSES = new Set([401, 404, 503]);
+
+/**
  * Builds the error for a KNOWN status whose body could not be read at all —
- * deliberately NOT via `errorFromResponse()`'s error_code-then-
+ * deliberately NOT via `errorFromResponse()`'s full error_code-then-
  * `STATUS_TO_CLASS` guessing, which exists for "the body parsed fine but had
  * no/unrecognized error_code," a different situation from "there's no body
- * to even attempt reading." Guessing a specific subclass from status alone
- * here is often wrong, since one status can carry several distinct business
- * meanings (see the call site's comment) — a plain `APIError` is the honest
- * answer in general. The one exception is `POST /tasks` with an
- * `idempotencyKey`: per this API's own contract, 409 there is used for
- * EXACTLY `IDEMPOTENCY_KEY_PROCESSING` and 422 for EXACTLY
+ * to even attempt reading" (no `error_code` can possibly be read here, so
+ * only the STATUS_TO_CLASS half of that logic ever applies). Guessing a
+ * specific subclass from status alone is only safe for statuses this API
+ * documents exactly one meaning for — see `UNAMBIGUOUS_UNREADABLE_STATUSES`.
+ * Every other status (400's ambiguity, or any status with no fallback class
+ * at all) gets a plain `APIError`, the honest answer when the class can't be
+ * determined. `POST /tasks` with an `idempotencyKey` gets its own two
+ * exceptions ahead of that: per this API's own contract, 409 there is used
+ * for EXACTLY `IDEMPOTENCY_KEY_PROCESSING` and 422 for EXACTLY
  * `IDEMPOTENCY_KEY_MISMATCH` (see `ERROR_CODE_TO_CLASS`/`STATUS_TO_CLASS`
  * above) — nothing else is documented to use either status on that
  * endpoint, so those two keep their specific, actionable classes even
- * without the body confirming it. The original read failure is always
- * preserved as `cause`.
+ * without the body confirming it (409 outside that endpoint has no fixed
+ * meaning here, so it isn't in `UNAMBIGUOUS_UNREADABLE_STATUSES`). The
+ * original read failure is always preserved as `cause`.
  */
 function errorForUnreadableBody(
   status: number,
@@ -658,6 +674,10 @@ function errorForUnreadableBody(
       status,
       cause,
     });
+  }
+  if (UNAMBIGUOUS_UNREADABLE_STATUSES.has(status)) {
+    const cls = STATUS_TO_CLASS[status];
+    return new cls(`HTTP ${status} (response body could not be read)`, { status, cause });
   }
   return new APIError(`HTTP ${status} (response body could not be read)`, { status, cause });
 }

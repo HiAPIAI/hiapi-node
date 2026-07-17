@@ -895,6 +895,43 @@ describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {
       },
     );
   });
+
+  test("an unreadable but UNAMBIGUOUS status (401/404/503) still surfaces its specific subclass, cause preserved", async () => {
+    // Unlike 400, these three statuses have exactly one documented meaning
+    // regardless of error_code — errors.ts's own class hierarchy promises
+    // AuthenticationError/NotFoundError/ServiceUnavailableError for them, and
+    // errorFromResponse() already honours that whenever the body reads
+    // successfully (even empty/garbage), via STATUS_TO_CLASS. Confirmed a
+    // prior version of errorForUnreadableBody collapsed ALL three into a
+    // plain APIError purely because of an unlucky body-read failure, silently
+    // breaking `instanceof AuthenticationError`/`NotFoundError`/
+    // `ServiceUnavailableError` checks callers use for auth-refresh, missing-
+    // resource handling, and backoff/circuit-breaker logic respectively.
+    const cases: Array<[number, unknown]> = [
+      [401, AuthenticationError],
+      [404, NotFoundError],
+      [503, ServiceUnavailableError],
+    ];
+    for (const [status, expectedClass] of cases) {
+      const readFailure = new Error(`stream reset (${status})`);
+      const impl: FetchLike = async () => ({
+        ok: false,
+        status,
+        headers: new Headers(),
+        text: () => Promise.reject(readFailure),
+      } as unknown as Response);
+      await assert.rejects(
+        client({ fetch: impl, maxRetries: 0 }).tasks.retrieve("t"),
+        (err: unknown) => {
+          assert.ok(err instanceof (expectedClass as new (...args: never[]) => Error), `status=${status}`);
+          assert.equal(Object.getPrototypeOf(err), (expectedClass as { prototype: unknown }).prototype);
+          assert.equal((err as APIError).status, status);
+          assert.equal((err as APIError).cause, readFailure);
+          return true;
+        },
+      );
+    }
+  });
 });
 
 describe("error mapping", () => {

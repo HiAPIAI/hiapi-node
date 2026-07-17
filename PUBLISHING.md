@@ -19,11 +19,17 @@ npm publish --access public
 npm view hiapi version
 ```
 
-## Later releases (tag-driven CI)
+## Later releases (CI, triggered by pushing to main)
 
-`.github/workflows/publish.yml` publishes on every `v*` tag with npm
-[provenance](https://docs.npmjs.com/generating-provenance-statements)
-(requires the GitHub repo to be public).
+`.github/workflows/publish.yml` runs on every push to `main` — NOT on a
+pushed tag. It checks the npm registry directly for whether
+`package.json`'s current version is already published; if not, it publishes
+with npm [provenance](https://docs.npmjs.com/generating-provenance-statements)
+(requires the GitHub repo to be public), then creates and pushes a `vX.Y.Z`
+git tag as a record of the release (not as what triggered it). If that
+version is already on npm, the whole run is a no-op except for making sure
+the tag exists — safe to push to main any number of times without bumping
+the version.
 
 One-time setup: create a **granular automation token** on npmjs.com (Packages:
 Read and write, bypasses 2FA/OTP) and store it as the `NPM_TOKEN` secret in the
@@ -35,13 +41,15 @@ Per release:
 # 1. Bump the version in BOTH places (a unit test enforces they match):
 #    - package.json        "version"
 #    - src/version.ts      VERSION
-# 2. Commit, tag, push.
+# 2. Commit, push to main.
 git commit -am "release: vX.Y.Z"
-git tag vX.Y.Z
-git push origin main --tags
+git push origin main
 ```
 
-CI runs `npm test` and then `npm publish --provenance --access public`.
+That's it — do **not** create the `vX.Y.Z` tag yourself; the workflow does
+that after a successful publish. Pushing it ahead of time doesn't skip
+anything (the workflow doesn't look at tags to decide whether to publish),
+but there's no reason to.
 
 ## Notes
 

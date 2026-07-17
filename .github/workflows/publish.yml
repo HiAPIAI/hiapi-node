@@ -1,35 +1,56 @@
 name: Publish to npm
 
-# Triggered by pushes landing on main — NOT by an arbitrary `v*` tag push (the
+# Triggered by pushes landing on main — NOT by an arbitrary `v*` tag push (an
 # earlier design). GitHub Actions runs a workflow using the file content AT
 # THE REF THAT TRIGGERED THE EVENT: for a tag push, that's whatever
 # publish.yml exists at the TAGGED COMMIT, not main's reviewed copy. A
 # contributor who can push a tag (but not merge to main) could therefore tag
-# a side commit carrying a modified copy of this very file — e.g. with the
-# HEAD-equality check that used to live here deleted — and it would still
-# run with this repo's NPM_TOKEN and id-token:write. That check was
-# self-referential: it lived in the same untrusted file it was meant to
-# gate. `push: branches: [main]` closes this because the workflow definition
-# that executes is always whatever landed on main itself, which (assuming
-# main is protected and requires review to push to) is the actual trust
-# boundary — there's no ref for an attacker to point at that runs a
-# different copy of this file. Publishing then happens automatically
-# whenever package.json's version on main has no matching git tag yet; the
-# release tag is created AFTER a successful publish, as a record, not as
-# the trigger.
+# a side commit carrying a modified copy of this very file — e.g. with any
+# safety check deleted — and it would still run with this repo's NPM_TOKEN
+# and id-token:write. `push: branches: [main]` closes this because the
+# workflow definition that executes is always whatever landed on main
+# itself, which (assuming main is protected and requires review to push to)
+# is the actual trust boundary — there's no ref an attacker can point at
+# that runs a different copy of this file.
+#
+# Whether to publish is decided by querying the npm registry (`npm view
+# <pkg>@<version>`), NOT by checking for a local git tag (a still-earlier
+# revision did: `git rev-parse --verify refs/tags/vX`). A leftover/stray tag
+# — created early, by hand, by another tool, or by a previous run whose
+# publish step failed AFTER tagging — would make that version's release
+# silently skipped forever with no error. Conversely, if `npm publish`
+# succeeds but the tag-push step then fails (network blip, permissions), a
+# tag-based check would see no tag on the next run, judge the version
+# unpublished, and retry `npm publish` for an already-published, immutable
+# version — a hard failure on every subsequent push until someone manually
+# intervenes. npm itself is the actual thing being asked about, so it's
+# queried directly; tagging below is a separate, idempotent, best-effort
+# record that runs unconditionally afterward and tolerates having already
+# been done by an earlier run.
 on:
   push:
     branches: [main]
+
+# Serializes concurrent runs of this workflow (e.g. two pushes to main close
+# together) so two runs can't both observe "not yet published" for the same
+# version and race each other into `npm publish` — npm itself rejects the
+# loser with a hard error since versions are immutable, which would fail
+# that run's job for no real reason. `cancel-in-progress: false`: a queued
+# run must still run to completion (it may cover a newer version), not be
+# cancelled by the next push landing.
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  check:
+  publish:
     runs-on: ubuntu-latest
-    outputs:
-      skip: ${{ steps.check.outputs.skip }}
-      version: ${{ steps.check.outputs.version }}
+    permissions:
+      contents: write # to push the release tag after a successful publish
+      id-token: write # npm --provenance attestation
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,37 +58,36 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - id: check
-        name: Check whether this version was already released
-        run: |
-          pkg="$(node -p "require('./package.json').version")"
-          if git rev-parse -q --verify "refs/tags/v$pkg" >/dev/null; then
-            echo "v$pkg is already tagged — skipping publish"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "version=$pkg" >> "$GITHUB_OUTPUT"
-          fi
-
-  publish:
-    needs: check
-    if: needs.check.outputs.skip == 'false'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # to push the release tag after a successful publish
-      id-token: write # npm --provenance attestation
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
           registry-url: https://registry.npmjs.org
-      - run: npm ci
-      - run: npm test
-      - run: npm publish --provenance --access public
+      - id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - id: published
+        name: Check the npm registry for this version (authoritative — not local git tags)
+        run: |
+          if npm view "hiapi@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
+            echo "hiapi@${{ steps.version.outputs.version }} is already on npm — skipping publish"
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.published.outputs.value == 'false'
+        run: npm ci
+      - if: steps.published.outputs.value == 'false'
+        run: npm test
+      - if: steps.published.outputs.value == 'false'
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Tag the release
+      - name: Ensure the release tag exists
+        # Idempotent and unconditional: records a version npm confirms is
+        # published, whether THIS run just published it or an earlier run
+        # already had — the latter is exactly the recovery path for a
+        # previous run's tag-push having failed after a successful publish.
         run: |
-          git tag "v${{ needs.check.outputs.version }}"
-          git push origin "v${{ needs.check.outputs.version }}"
+          v="v${{ steps.version.outputs.version }}"
+          if git rev-parse -q --verify "refs/tags/$v" >/dev/null; then
+            echo "$v already exists — nothing to do"
+          else
+            git tag "$v"
+            git push origin "$v"
+          fi
