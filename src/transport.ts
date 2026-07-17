@@ -626,15 +626,20 @@ function errorFromResponse(status: number, rawText: string): APIError {
 
 /**
  * Statuses whose meaning is fixed regardless of `error_code`: no code in
- * `ERROR_CODE_TO_CLASS` is documented to occur at 401, 404, or 503, so
+ * `ERROR_CODE_TO_CLASS` is documented to occur at 401 or 404, so
  * `STATUS_TO_CLASS`'s fallback mapping for them is exactly as reliable as it
  * is for a body that parsed fine but carried no/unrecognized `error_code` —
- * safe to use even without a body to confirm it. 400 is deliberately
- * excluded: it's the one status this API documents two distinct meanings
- * for (`INVALID_REQUEST` and `MODEL_UNAVAILABLE`), so guessing a specific
- * subclass for it from status alone could actually be wrong.
+ * safe to use even without a body to confirm it. Both 400 and 503 are
+ * deliberately excluded, each ambiguous for the same reason: this API
+ * documents more than one `error_code` at that status. 400 covers both
+ * `INVALID_REQUEST` and `MODEL_UNAVAILABLE`; 503 covers both a plain
+ * platform-unavailable response (→ `STATUS_TO_CLASS[503]` =
+ * `ServiceUnavailableError`, correct when there's truly no error_code) AND
+ * `STORAGE_UNAVAILABLE` (→ the distinct `StorageUnavailableError`) — an
+ * unreadable 503 body could honestly be either, so guessing the generic one
+ * would silently misclassify a storage failure as a plain service outage.
  */
-const UNAMBIGUOUS_UNREADABLE_STATUSES = new Set([401, 404, 503]);
+const UNAMBIGUOUS_UNREADABLE_STATUSES = new Set([401, 404]);
 
 /**
  * Builds the error for a KNOWN status whose body could not be read at all —

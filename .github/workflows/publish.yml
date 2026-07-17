@@ -31,16 +31,24 @@ on:
   push:
     branches: [main]
 
-# Serializes concurrent runs of this workflow (e.g. two pushes to main close
-# together) so two runs can't both observe "not yet published" for the same
-# version and race each other into `npm publish` — npm itself rejects the
-# loser with a hard error since versions are immutable, which would fail
-# that run's job for no real reason. `cancel-in-progress: false`: a queued
-# run must still run to completion (it may cover a newer version), not be
-# cancelled by the next push landing.
+# Serializes runs of this workflow so two pushes to main close together
+# can't both observe "not yet published" for the same version and race each
+# other into `npm publish` (npm rejects the loser with a hard error, since
+# versions are immutable). `cancel-in-progress: false` alone is NOT enough
+# here: GitHub allows at most one QUEUED (pending) run per concurrency group
+# regardless of that setting — a third push arriving while one run is
+# in-progress and a second is already queued CANCELS the queued one and
+# takes its place, so an intermediate version could be silently dropped and
+# never published. `queue: max` changes this to a real FIFO queue (up to
+# 100 runs) instead of a single evictable slot — confirmed against GitHub's
+# own docs on `concurrency`, which describe exactly this "queued run gets
+# evicted by a newer one" behavior as the default and `queue: max` as the
+# fix. (`queue: max` cannot be combined with `cancel-in-progress: true` —
+# not a concern here since this workflow deliberately never cancels.)
 concurrency:
   group: publish
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read
@@ -63,13 +71,44 @@ jobs:
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
       - id: published
         name: Check the npm registry for this version (authoritative — not local git tags)
+        # Only a CONFIRMED 404 (the version genuinely doesn't exist on npm,
+        # identified by npm's own "code E404" marker — verified against a
+        # real nonexistent-version query) is treated as "not published."
+        # Any other failure (DNS, timeout, TLS, rate limiting, a registry
+        # 5xx, auth) is a failure to determine the answer, not evidence the
+        # version is missing — treating it as "not published" would let the
+        # workflow attempt to publish an already-released, immutable version
+        # (or worse, mask a real infra problem). Retried a few times for
+        # exactly those inconclusive failures, then fails closed loudly
+        # (with the real npm output) rather than guessing.
         run: |
-          if npm view "hiapi@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
-            echo "hiapi@${{ steps.version.outputs.version }} is already on npm — skipping publish"
-            echo "value=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=false" >> "$GITHUB_OUTPUT"
-          fi
+          version="${{ steps.version.outputs.version }}"
+          attempt=1
+          max_attempts=3
+          while true; do
+            set +e
+            output="$(npm view "hiapi@$version" version 2>&1)"
+            exit_code=$?
+            set -e
+            if [ "$exit_code" -eq 0 ]; then
+              echo "hiapi@$version is already on npm — skipping publish"
+              echo "value=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            if printf '%s' "$output" | grep -q "code E404"; then
+              echo "hiapi@$version is not on npm yet"
+              echo "value=false" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "$output"
+              echo "::error::npm view failed for a non-404 reason after $max_attempts attempts — refusing to guess whether hiapi@$version is published"
+              exit 1
+            fi
+            echo "npm view attempt $attempt failed for a non-404 reason, retrying in 5s: $output"
+            attempt=$((attempt + 1))
+            sleep 5
+          done
       - if: steps.published.outputs.value == 'false'
         run: npm ci
       - if: steps.published.outputs.value == 'false'
@@ -78,16 +117,40 @@ jobs:
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Ensure the release tag exists
-        # Idempotent and unconditional: records a version npm confirms is
-        # published, whether THIS run just published it or an earlier run
-        # already had — the latter is exactly the recovery path for a
-        # previous run's tag-push having failed after a successful publish.
+      - name: Ensure the release tag exists and points at the published commit
+        # The commit to tag depends on WHO published this version:
+        #  - If this run just published it (value == 'false' above), the
+        #    current checkout — github.sha — IS that commit; no need to ask
+        #    npm to confirm what we just did ourselves.
+        #  - If it was already published (value == 'true'), github.sha is
+        #    NOT necessarily right: this run could have been triggered by a
+        #    later, unrelated commit that didn't bump the version. npm's own
+        #    `gitHead` metadata (recorded at publish time — confirmed
+        #    present on real published packages) is the actual record of
+        #    which commit that release came from.
+        # Either way, an EXISTING tag is verified to point at the same
+        # commit rather than trusted on sight — silently accepting a
+        # mismatched/stray tag would let `vX.Y.Z` on GitHub point at
+        # different source than what npm actually shipped.
         run: |
           v="v${{ steps.version.outputs.version }}"
-          if git rev-parse -q --verify "refs/tags/$v" >/dev/null; then
-            echo "$v already exists — nothing to do"
+          if [ "${{ steps.published.outputs.value }}" = "false" ]; then
+            target_sha="${{ github.sha }}"
           else
-            git tag "$v"
+            target_sha="$(npm view "hiapi@${{ steps.version.outputs.version }}" gitHead 2>/dev/null || true)"
+            if [ -z "$target_sha" ]; then
+              echo "::error::npm has no gitHead recorded for hiapi@${{ steps.version.outputs.version }} — cannot verify which commit was published; refusing to guess a tag target. Tag it manually once you've confirmed the right commit."
+              exit 1
+            fi
+          fi
+          if git rev-parse -q --verify "refs/tags/$v" >/dev/null; then
+            existing_sha="$(git rev-list -n 1 "$v")"
+            if [ "$existing_sha" != "$target_sha" ]; then
+              echo "::error::tag $v points at $existing_sha but the published commit is $target_sha — refusing to silently accept a mismatched tag. Investigate and fix it manually."
+              exit 1
+            fi
+            echo "$v already exists and matches the published commit"
+          else
+            git tag "$v" "$target_sha"
             git push origin "$v"
           fi

@@ -896,21 +896,20 @@ describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {
     );
   });
 
-  test("an unreadable but UNAMBIGUOUS status (401/404/503) still surfaces its specific subclass, cause preserved", async () => {
-    // Unlike 400, these three statuses have exactly one documented meaning
-    // regardless of error_code — errors.ts's own class hierarchy promises
-    // AuthenticationError/NotFoundError/ServiceUnavailableError for them, and
-    // errorFromResponse() already honours that whenever the body reads
-    // successfully (even empty/garbage), via STATUS_TO_CLASS. Confirmed a
-    // prior version of errorForUnreadableBody collapsed ALL three into a
-    // plain APIError purely because of an unlucky body-read failure, silently
-    // breaking `instanceof AuthenticationError`/`NotFoundError`/
-    // `ServiceUnavailableError` checks callers use for auth-refresh, missing-
-    // resource handling, and backoff/circuit-breaker logic respectively.
+  test("an unreadable but UNAMBIGUOUS status (401/404) still surfaces its specific subclass, cause preserved", async () => {
+    // Unlike 400 (and 503 — see the next test), these two statuses have
+    // exactly one documented meaning regardless of error_code — errors.ts's
+    // own class hierarchy promises AuthenticationError/NotFoundError for
+    // them, and errorFromResponse() already honours that whenever the body
+    // reads successfully (even empty/garbage), via STATUS_TO_CLASS.
+    // Confirmed a prior version of errorForUnreadableBody collapsed both
+    // into a plain APIError purely because of an unlucky body-read failure,
+    // silently breaking `instanceof AuthenticationError`/`NotFoundError`
+    // checks callers use for auth-refresh and missing-resource handling
+    // respectively.
     const cases: Array<[number, unknown]> = [
       [401, AuthenticationError],
       [404, NotFoundError],
-      [503, ServiceUnavailableError],
     ];
     for (const [status, expectedClass] of cases) {
       const readFailure = new Error(`stream reset (${status})`);
@@ -931,6 +930,36 @@ describe("409 IDEMPOTENCY_KEY_PROCESSING", () => {
         },
       );
     }
+  });
+
+  test("an unreadable 503 never guesses a specific subclass — plain APIError, cause preserved", async () => {
+    // 503 is ambiguous the same way 400 is, just with a different pair of
+    // meanings: a plain platform-unavailable response (no error_code —
+    // STATUS_TO_CLASS[503] = ServiceUnavailableError is correct there) AND
+    // error_code=STORAGE_UNAVAILABLE (→ the distinct StorageUnavailableError
+    // — confirmed emitted at HTTP 503 by the real backend, not just at some
+    // other status). With the body unreadable there's no error_code to tell
+    // the two apart, so guessing ServiceUnavailableError — which a prior
+    // version of UNAMBIGUOUS_UNREADABLE_STATUSES did by including 503 — would
+    // silently misclassify a storage failure as a plain service outage.
+    const readFailure = new Error("stream reset");
+    const impl: FetchLike = async () => ({
+      ok: false,
+      status: 503,
+      headers: new Headers(),
+      text: () => Promise.reject(readFailure),
+    } as unknown as Response);
+    await assert.rejects(
+      client({ fetch: impl, maxRetries: 0 }).tasks.retrieve("t"),
+      (err: unknown) => {
+        // Precisely APIError, not any subclass (ServiceUnavailableError and
+        // StorageUnavailableError both included).
+        assert.equal(Object.getPrototypeOf(err), APIError.prototype);
+        assert.equal((err as APIError).status, 503);
+        assert.equal((err as APIError).cause, readFailure);
+        return true;
+      },
+    );
   });
 });
 
