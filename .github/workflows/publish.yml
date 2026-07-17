@@ -62,7 +62,38 @@ permissions:
   contents: read
 
 jobs:
+  # Mirrors ci.yml's matrix — duplicated here rather than referenced via
+  # `workflow_run` so `publish` can gate on it with a plain `needs:` tied to
+  # the exact commit that triggered THIS run. ci.yml is a separate workflow
+  # with no dependency relationship to this one; both fire independently on
+  # the same `push: branches: [main]` event, so without this, `publish`
+  # could reach `npm publish` while ci.yml's broader matrix is still running
+  # — or has already failed — on the very same commit. The `publish` job
+  # below only tests ubuntu-latest + Node 22 itself (needed regardless, to
+  # actually build and ship dist/); ci.yml's own comment on why Windows is
+  # tested (scripts/smoke-types.mjs has Windows-specific code that
+  # ubuntu-latest alone never exercises) applies just as much to what's
+  # about to be published here. `workflow_run` was considered and rejected:
+  # it always evaluates the workflow file from the default branch regardless
+  # of which SHA triggered it, and requires manually cross-checking
+  # `head_sha` — more moving parts than duplicating a 6-job matrix is worth,
+  # given how infrequently this workflow actually runs.
+  test-matrix:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - run: npm test
+
   publish:
+    needs: test-matrix
     runs-on: ubuntu-latest
     permissions:
       contents: write # to push the release tag after a successful publish
@@ -75,8 +106,35 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # Unconditional and this early specifically so `semver` (a
+      # devDependency) is on disk before the very first step that needs it
+      # — version validation, right below.
+      - run: npm ci
       - id: version
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        name: Read and validate package.json's version
+        # Validated as CANONICAL semver (semver.valid(v) === v, not just
+        # "parses") before it's used ANYWHERE else in this workflow — as an
+        # `npm view hiapi@$version` selector, a semver comparison, an
+        # `npm publish` argument, or a git tag suffix. A non-canonical or
+        # npm-dist-tag-shaped value (e.g. a stray "latest", a "v"-prefixed
+        # version, a range) reaching those unvalidated could get
+        # misinterpreted by npm as a SELECTOR rather than a literal version
+        # — confirmed by reproduction that `npm view hiapi@latest` resolves
+        # via the dist-tag, not a literal string match, which would make the
+        # `published` check below wrongly report an unrelated version as
+        # "already published" and silently skip the real release.
+        run: |
+          canonical="$(node -e '
+            const semver = require("semver");
+            const raw = require("./package.json").version;
+            const c = semver.valid(raw);
+            if (c === null || c !== raw) {
+              console.error(`package.json version "${raw}" is not canonical semver (semver.valid gives ${JSON.stringify(c)})`);
+              process.exit(1);
+            }
+            process.stdout.write(c);
+          ')"
+          echo "version=$canonical" >> "$GITHUB_OUTPUT"
       - id: published
         name: Check the npm registry for this version (authoritative — not local git tags)
         # Only a CONFIRMED 404 (the version genuinely doesn't exist on npm,
@@ -117,8 +175,6 @@ jobs:
             attempt=$((attempt + 1))
             sleep 5
           done
-      - if: steps.published.outputs.value == 'false'
-        run: npm ci
       - if: steps.published.outputs.value == 'false'
         run: npm test
       - id: publish-tag
