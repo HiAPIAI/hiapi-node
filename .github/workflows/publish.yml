@@ -45,6 +45,14 @@ on:
 # evicted by a newer one" behavior as the default and `queue: max` as the
 # fix. (`queue: max` cannot be combined with `cancel-in-progress: true` —
 # not a concern here since this workflow deliberately never cancels.)
+#
+# `queue: max` does NOT guarantee runs execute in push order, though — per
+# GitHub's own docs, FIFO here is ordered by when each run started WAITING
+# on the group, not by dispatch/push time, and actual start time can vary.
+# So a run for a newer version can finish publishing before an
+# already-queued run for an older version gets to its own `npm publish` —
+# see the "decide the npm dist-tag" step below for why that alone would
+# otherwise roll the package's `latest` dist-tag backward.
 concurrency:
   group: publish
   cancel-in-progress: false
@@ -113,8 +121,44 @@ jobs:
         run: npm ci
       - if: steps.published.outputs.value == 'false'
         run: npm test
+      - id: publish-tag
+        if: steps.published.outputs.value == 'false'
+        name: Decide the npm dist-tag for this publish
+        # `npm publish` with no --tag sets `latest` to whatever was just
+        # published, unconditionally — it does NOT compare semver. Combined
+        # with `queue: max` not guaranteeing push order (see the
+        # `concurrency` comment above), a run for an OLDER version reaching
+        # this step after a NEWER version already published would roll
+        # `latest` backward with no error, a user-visible regression for
+        # anyone running `npm install hiapi` right after. Checked here,
+        # immediately before publishing (not earlier, to keep the window
+        # this can still race in as small as possible): only tag this
+        # publish `latest` if it's actually semver-newer than whatever's
+        # `latest` on the registry right now; otherwise publish under a
+        # distinct tag so `latest` is left alone.
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          current_latest="$(npm view hiapi@latest version 2>/dev/null || true)"
+          if [ -z "$current_latest" ]; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            is_newer="$(node -e '
+              const [v, latest] = process.argv.slice(1).map((s) => s.split(".").map(Number));
+              let cmp = 0;
+              for (let i = 0; i < 3; i++) {
+                if (v[i] !== latest[i]) { cmp = v[i] - latest[i]; break; }
+              }
+              process.stdout.write(cmp > 0 ? "true" : "false");
+            ' "$version" "$current_latest")"
+            if [ "$is_newer" = "true" ]; then
+              echo "tag=latest" >> "$GITHUB_OUTPUT"
+            else
+              echo "tag=superseded-$version" >> "$GITHUB_OUTPUT"
+              echo "::warning::hiapi@$version is not newer than the current latest ($current_latest) — an out-of-order concurrent run must have published a newer version first. Publishing under a non-latest dist-tag so latest isn't rolled back."
+            fi
+          fi
       - if: steps.published.outputs.value == 'false'
-        run: npm publish --provenance --access public
+        run: npm publish --provenance --access public --tag "${{ steps.publish-tag.outputs.tag }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Ensure the release tag exists and points at the published commit
