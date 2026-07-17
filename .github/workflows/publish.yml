@@ -146,15 +146,27 @@ jobs:
         #    as "no latest tag exists yet" would restore the exact bug this
         #    step exists to prevent — publishing as `latest` while genuinely
         #    unable to tell whether a newer version is already there.
-        #  - The comparison uses the real `semver` package (a devDependency,
-        #    installed by the `npm ci` step above — irrelevant to the
-        #    published SDK's own zero-dependency runtime, which only that
-        #    `files` allowlist ships), not a hand-rolled `.split(".")`
-        #    parser: a naive numeric split mishandles any prerelease version
-        #    (e.g. `1.1.0-beta.1` splits to a NaN component) — semver
-        #    precedence rules (numeric vs. alphanumeric identifiers, "no
-        #    prerelease outranks any prerelease of the same base version")
-        #    are exactly what a real implementation is for.
+        #  - The comparison uses the real `semver` package's `.gt()`
+        #    PRECEDENCE comparison (a devDependency, installed by the
+        #    `npm ci` step above — irrelevant to the published SDK's own
+        #    zero-dependency runtime, which only that `files` allowlist
+        #    ships), not a hand-rolled `.split(".")` parser (mishandles any
+        #    prerelease version — e.g. `1.1.0-beta.1` splits to a NaN
+        #    component) and NOT the `semver` CLI's `-r <range>` matching
+        #    either — confirmed by direct reproduction that range matching
+        #    is NOT the same question: node-semver's range semantics
+        #    deliberately EXCLUDE prerelease versions from matching a plain
+        #    range like `>1.0.0` unless the range's own comparator shares
+        #    the same [major,minor,patch] tuple (this prevents dependency
+        #    ranges from silently resolving to untested prereleases) — so
+        #    `semver -r ">1.0.0" "1.1.0-beta.1"` reports no match even
+        #    though `semver.gt("1.1.0-beta.1", "1.0.0")` is genuinely `true`
+        #    by real SemVer precedence. Using range matching here would
+        #    misroute an actually-newer prerelease to a non-latest tag.
+        #    `.gt()` failing for any other reason (a malformed version from
+        #    either side, an unexpected exception) exits nonzero and is
+        #    treated as inconclusive, same as the registry lookup above —
+        #    not silently folded into "not newer."
         run: |
           version="${{ steps.version.outputs.version }}"
           attempt=1
@@ -181,11 +193,35 @@ jobs:
             attempt=$((attempt + 1))
             sleep 5
           done
-          if [ -z "$current_latest" ] || node_modules/.bin/semver -r ">$current_latest" "$version" >/dev/null; then
+          if [ -z "$current_latest" ]; then
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=superseded-$version" >> "$GITHUB_OUTPUT"
-            echo "::warning::hiapi@$version is not newer than the current latest ($current_latest) — an out-of-order concurrent run must have published a newer version first. Publishing under a non-latest dist-tag so latest isn't rolled back."
+            set +e
+            is_newer="$(node -e '
+              const semver = require("semver");
+              const [version, currentLatest] = process.argv.slice(1);
+              if (!semver.valid(version)) {
+                console.error(`the version being published (${version}) is not valid semver`);
+                process.exit(2);
+              }
+              if (!semver.valid(currentLatest)) {
+                console.error(`the current npm latest (${currentLatest}) is not valid semver`);
+                process.exit(2);
+              }
+              process.stdout.write(semver.gt(version, currentLatest) ? "true" : "false");
+            ' "$version" "$current_latest")"
+            node_exit=$?
+            set -e
+            if [ "$node_exit" -ne 0 ]; then
+              echo "::error::could not compare hiapi@$version against the current latest ($current_latest) via semver — refusing to guess the dist-tag"
+              exit 1
+            fi
+            if [ "$is_newer" = "true" ]; then
+              echo "tag=latest" >> "$GITHUB_OUTPUT"
+            else
+              echo "tag=superseded-$version" >> "$GITHUB_OUTPUT"
+              echo "::warning::hiapi@$version is not newer than the current latest ($current_latest) — an out-of-order concurrent run must have published a newer version first. Publishing under a non-latest dist-tag so latest isn't rolled back."
+            fi
           fi
       - if: steps.published.outputs.value == 'false'
         run: npm publish --provenance --access public --tag "${{ steps.publish-tag.outputs.tag }}"
