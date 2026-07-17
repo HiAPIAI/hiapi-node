@@ -133,29 +133,59 @@ jobs:
         # anyone running `npm install hiapi` right after. Checked here,
         # immediately before publishing (not earlier, to keep the window
         # this can still race in as small as possible): only tag this
-        # publish `latest` if it's actually semver-newer than whatever's
-        # `latest` on the registry right now; otherwise publish under a
-        # distinct tag so `latest` is left alone.
+        # publish `latest` if it's actually newer than whatever's `latest`
+        # on the registry right now; otherwise publish under a distinct tag
+        # so `latest` is left alone.
+        #
+        # Two things this step is deliberately careful about, both found by
+        # reviewing an earlier version of this exact step:
+        #  - The `npm view hiapi@latest` lookup reuses the same "only a
+        #    confirmed E404 means it doesn't exist" retry discipline as the
+        #    `published` step above. Silently treating a TRANSIENT lookup
+        #    failure (DNS, timeout, rate limiting, a registry 5xx) the same
+        #    as "no latest tag exists yet" would restore the exact bug this
+        #    step exists to prevent — publishing as `latest` while genuinely
+        #    unable to tell whether a newer version is already there.
+        #  - The comparison uses the real `semver` package (a devDependency,
+        #    installed by the `npm ci` step above — irrelevant to the
+        #    published SDK's own zero-dependency runtime, which only that
+        #    `files` allowlist ships), not a hand-rolled `.split(".")`
+        #    parser: a naive numeric split mishandles any prerelease version
+        #    (e.g. `1.1.0-beta.1` splits to a NaN component) — semver
+        #    precedence rules (numeric vs. alphanumeric identifiers, "no
+        #    prerelease outranks any prerelease of the same base version")
+        #    are exactly what a real implementation is for.
         run: |
           version="${{ steps.version.outputs.version }}"
-          current_latest="$(npm view hiapi@latest version 2>/dev/null || true)"
-          if [ -z "$current_latest" ]; then
+          attempt=1
+          max_attempts=3
+          while true; do
+            set +e
+            output="$(npm view hiapi@latest version 2>&1)"
+            exit_code=$?
+            set -e
+            if [ "$exit_code" -eq 0 ]; then
+              current_latest="$output"
+              break
+            fi
+            if printf '%s' "$output" | grep -q "code E404"; then
+              current_latest="" # no latest tag exists yet — first-ever publish.
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "$output"
+              echo "::error::npm view hiapi@latest failed for a non-404 reason after $max_attempts attempts — refusing to guess whether this publish should become latest"
+              exit 1
+            fi
+            echo "npm view hiapi@latest attempt $attempt failed for a non-404 reason, retrying in 5s: $output"
+            attempt=$((attempt + 1))
+            sleep 5
+          done
+          if [ -z "$current_latest" ] || node_modules/.bin/semver -r ">$current_latest" "$version" >/dev/null; then
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           else
-            is_newer="$(node -e '
-              const [v, latest] = process.argv.slice(1).map((s) => s.split(".").map(Number));
-              let cmp = 0;
-              for (let i = 0; i < 3; i++) {
-                if (v[i] !== latest[i]) { cmp = v[i] - latest[i]; break; }
-              }
-              process.stdout.write(cmp > 0 ? "true" : "false");
-            ' "$version" "$current_latest")"
-            if [ "$is_newer" = "true" ]; then
-              echo "tag=latest" >> "$GITHUB_OUTPUT"
-            else
-              echo "tag=superseded-$version" >> "$GITHUB_OUTPUT"
-              echo "::warning::hiapi@$version is not newer than the current latest ($current_latest) — an out-of-order concurrent run must have published a newer version first. Publishing under a non-latest dist-tag so latest isn't rolled back."
-            fi
+            echo "tag=superseded-$version" >> "$GITHUB_OUTPUT"
+            echo "::warning::hiapi@$version is not newer than the current latest ($current_latest) — an out-of-order concurrent run must have published a newer version first. Publishing under a non-latest dist-tag so latest isn't rolled back."
           fi
       - if: steps.published.outputs.value == 'false'
         run: npm publish --provenance --access public --tag "${{ steps.publish-tag.outputs.tag }}"
