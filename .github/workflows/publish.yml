@@ -98,6 +98,15 @@ jobs:
     permissions:
       contents: write # to push the release tag after a successful publish
       id-token: write # npm --provenance attestation
+      # Confirmed by a real run: GitHub rejects a GITHUB_TOKEN git-push of ANY
+      # ref (including a lightweight tag pointing at an already-merged commit
+      # already on main) whose tree contains `.github/workflows/*`, unless the
+      # token also has this permission — `contents: write` alone isn't enough,
+      # even though nothing about this workflow's own content is being
+      # created or changed by tagging. (If this alone turns out insufficient
+      # in practice, the documented fallback is a PAT with the `workflow`
+      # scope in place of GITHUB_TOKEN for this step specifically.)
+      workflows: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
