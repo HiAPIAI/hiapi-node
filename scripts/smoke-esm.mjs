@@ -15,12 +15,12 @@ import {
   Task,
   VERSION,
   verifyWebhook,
-} from "hiapi";
+} from "hiapi_ai";
 
 const pkgPath = new URL("../package.json", import.meta.url);
 const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
 assert.equal(VERSION, pkg.version);
-assert.equal(pkg.name, "hiapi");
+assert.equal(pkg.name, "hiapi_ai");
 assert.equal(typeof HiAPI, "function");
 assert.equal(typeof verifyWebhook, "function");
 assert.ok(new HiAPIError("x") instanceof Error);

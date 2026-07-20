@@ -98,7 +98,7 @@ describe("version contract", () => {
     const pkg = JSON.parse(
       readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
     ) as { version: string; name: string };
-    assert.equal(pkg.name, "hiapi");
+    assert.equal(pkg.name, "hiapi_ai");
     assert.equal(VERSION, pkg.version);
   });
 });

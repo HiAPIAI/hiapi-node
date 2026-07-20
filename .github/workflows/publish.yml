@@ -114,12 +114,12 @@ jobs:
         name: Read and validate package.json's version
         # Validated as CANONICAL semver (semver.valid(v) === v, not just
         # "parses") before it's used ANYWHERE else in this workflow — as an
-        # `npm view hiapi@$version` selector, a semver comparison, an
+        # `npm view hiapi_ai@$version` selector, a semver comparison, an
         # `npm publish` argument, or a git tag suffix. A non-canonical or
         # npm-dist-tag-shaped value (e.g. a stray "latest", a "v"-prefixed
         # version, a range) reaching those unvalidated could get
         # misinterpreted by npm as a SELECTOR rather than a literal version
-        # — confirmed by reproduction that `npm view hiapi@latest` resolves
+        # — confirmed by reproduction that `npm view hiapi_ai@latest` resolves
         # via the dist-tag, not a literal string match, which would make the
         # `published` check below wrongly report an unrelated version as
         # "already published" and silently skip the real release.
@@ -153,22 +153,22 @@ jobs:
           max_attempts=3
           while true; do
             set +e
-            output="$(npm view "hiapi@$version" version 2>&1)"
+            output="$(npm view "hiapi_ai@$version" version 2>&1)"
             exit_code=$?
             set -e
             if [ "$exit_code" -eq 0 ]; then
-              echo "hiapi@$version is already on npm — skipping publish"
+              echo "hiapi_ai@$version is already on npm — skipping publish"
               echo "value=true" >> "$GITHUB_OUTPUT"
               break
             fi
             if printf '%s' "$output" | grep -q "code E404"; then
-              echo "hiapi@$version is not on npm yet"
+              echo "hiapi_ai@$version is not on npm yet"
               echo "value=false" >> "$GITHUB_OUTPUT"
               break
             fi
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "$output"
-              echo "::error::npm view failed for a non-404 reason after $max_attempts attempts — refusing to guess whether hiapi@$version is published"
+              echo "::error::npm view failed for a non-404 reason after $max_attempts attempts — refusing to guess whether hiapi_ai@$version is published"
               exit 1
             fi
             echo "npm view attempt $attempt failed for a non-404 reason, retrying in 5s: $output"
@@ -186,7 +186,7 @@ jobs:
         # `concurrency` comment above), a run for an OLDER version reaching
         # this step after a NEWER version already published would roll
         # `latest` backward with no error, a user-visible regression for
-        # anyone running `npm install hiapi` right after. Checked here,
+        # anyone running `npm install hiapi_ai` right after. Checked here,
         # immediately before publishing (not earlier, to keep the window
         # this can still race in as small as possible): only tag this
         # publish `latest` if it's actually newer than whatever's `latest`
@@ -195,7 +195,7 @@ jobs:
         #
         # Two things this step is deliberately careful about, both found by
         # reviewing an earlier version of this exact step:
-        #  - The `npm view hiapi@latest` lookup reuses the same "only a
+        #  - The `npm view hiapi_ai@latest` lookup reuses the same "only a
         #    confirmed E404 means it doesn't exist" retry discipline as the
         #    `published` step above. Silently treating a TRANSIENT lookup
         #    failure (DNS, timeout, rate limiting, a registry 5xx) the same
@@ -230,7 +230,7 @@ jobs:
         # SemVer only consults the prerelease component as a tiebreaker when
         # major.minor.patch are EQUAL), which would otherwise tag a
         # prerelease `latest` the moment its base version outnumbers the
-        # current stable release — making a plain `npm install hiapi`
+        # current stable release — making a plain `npm install hiapi_ai`
         # default to an untested beta. SemVer precedence answers "which is
         # numerically greater," not "which should ship to everyone by
         # default"; npm's own dist-tag docs say `latest` is for the current
@@ -243,7 +243,7 @@ jobs:
         # relocated the exact race this whole step exists to prevent — with
         # `queue: max` not guaranteeing push order (see the `concurrency`
         # comment above), a run for `0.4.0-beta.1` executing AFTER a run for
-        # `0.4.0-beta.2` would silently roll `hiapi@next` backward the same
+        # `0.4.0-beta.2` would silently roll `hiapi_ai@next` backward the same
         # way an unguarded `latest` could. `decide_tag()` below is shared by
         # both paths for exactly that reason — a stable release and a
         # prerelease differ only in WHICH shared tag (`latest` vs `next`)
@@ -262,7 +262,7 @@ jobs:
             local current attempt=1 max_attempts=3 output exit_code
             while true; do
               set +e
-              output="$(npm view "hiapi@$shared_tag" version 2>&1)"
+              output="$(npm view "hiapi_ai@$shared_tag" version 2>&1)"
               exit_code=$?
               set -e
               if [ "$exit_code" -eq 0 ]; then
@@ -275,10 +275,10 @@ jobs:
               fi
               if [ "$attempt" -ge "$max_attempts" ]; then
                 echo "$output" >&2
-                echo "::error::npm view hiapi@$shared_tag failed for a non-404 reason after $max_attempts attempts — refusing to guess this publish's dist-tag" >&2
+                echo "::error::npm view hiapi_ai@$shared_tag failed for a non-404 reason after $max_attempts attempts — refusing to guess this publish's dist-tag" >&2
                 exit 1
               fi
-              echo "npm view hiapi@$shared_tag attempt $attempt failed for a non-404 reason, retrying in 5s: $output" >&2
+              echo "npm view hiapi_ai@$shared_tag attempt $attempt failed for a non-404 reason, retrying in 5s: $output" >&2
               attempt=$((attempt + 1))
               sleep 5
             done
@@ -304,13 +304,13 @@ jobs:
             node_exit=$?
             set -e
             if [ "$node_exit" -ne 0 ]; then
-              echo "::error::could not compare hiapi@$version against the current hiapi@$shared_tag ($current) via semver — refusing to guess the dist-tag" >&2
+              echo "::error::could not compare hiapi_ai@$version against the current hiapi_ai@$shared_tag ($current) via semver — refusing to guess the dist-tag" >&2
               exit 1
             fi
             if [ "$is_newer" = "true" ]; then
               echo "$shared_tag"
             else
-              echo "::warning::hiapi@$version is not newer than the current hiapi@$shared_tag ($current) — an out-of-order concurrent run must have published a newer version to that tag first. Publishing under a version-specific dist-tag so hiapi@$shared_tag isn't rolled back." >&2
+              echo "::warning::hiapi_ai@$version is not newer than the current hiapi_ai@$shared_tag ($current) — an out-of-order concurrent run must have published a newer version to that tag first. Publishing under a version-specific dist-tag so hiapi_ai@$shared_tag isn't rolled back." >&2
               echo "superseded-$version"
             fi
           }
@@ -345,9 +345,9 @@ jobs:
           if [ "${{ steps.published.outputs.value }}" = "false" ]; then
             target_sha="${{ github.sha }}"
           else
-            target_sha="$(npm view "hiapi@${{ steps.version.outputs.version }}" gitHead 2>/dev/null || true)"
+            target_sha="$(npm view "hiapi_ai@${{ steps.version.outputs.version }}" gitHead 2>/dev/null || true)"
             if [ -z "$target_sha" ]; then
-              echo "::error::npm has no gitHead recorded for hiapi@${{ steps.version.outputs.version }} — cannot verify which commit was published; refusing to guess a tag target. Tag it manually once you've confirmed the right commit."
+              echo "::error::npm has no gitHead recorded for hiapi_ai@${{ steps.version.outputs.version }} — cannot verify which commit was published; refusing to guess a tag target. Tag it manually once you've confirmed the right commit."
               exit 1
             fi
           fi

@@ -7,7 +7,7 @@
 // resolution modes — proving dist/esm/index.d.ts and dist/cjs/index.d.ts both
 // actually resolve and are structurally sound for a real TypeScript consumer.
 //
-// This is a package-name import (`from "hiapi"`), NOT self-reference: tsc's
+// This is a package-name import (`from "hiapi_ai"`), NOT self-reference: tsc's
 // self-reference algorithm (unlike Node's own runtime resolver, which does
 // support it) turned out — verified interactively — to not resolve a
 // same-name package from a loose, non-project subdirectory compile, so a
@@ -94,7 +94,7 @@ function runNpm(args, options) {
 }
 
 const CONSUMER_SOURCE = `
-import { HiAPI, type CreateTaskParams } from "hiapi";
+import { HiAPI, type CreateTaskParams } from "hiapi_ai";
 
 interface SeedanceInput {
   prompt: string;
@@ -180,7 +180,7 @@ try {
   // below before the SDK stopped referencing the bare global `ErrorOptions`
   // (an ES2022-only lib type) in its public API.
   const ERROR_CONSUMER_SOURCE = `
-import { HiAPIError, APIConnectionError, RunAbortedError } from "hiapi";
+import { HiAPIError, APIConnectionError, RunAbortedError } from "hiapi_ai";
 
 new HiAPIError("x", { cause: new Error("y") });
 new APIConnectionError("x", { cause: new Error("y") });

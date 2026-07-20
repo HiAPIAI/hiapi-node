@@ -39,7 +39,7 @@ export interface HiAPIOptions {
  * Client for the HiAPI unified async task API.
  *
  * ```ts
- * import { HiAPI } from "hiapi";
+ * import { HiAPI } from "hiapi_ai";
  *
  * const client = new HiAPI({ apiKey: "sk-..." }); // or set HIAPI_API_KEY
  * const task = await client.tasks.run({

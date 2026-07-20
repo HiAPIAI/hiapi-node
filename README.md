@@ -14,7 +14,7 @@ Zero-dependency Node.js client for the [HiAPI](https://hiapi.ai) **unified async
 ## Install
 
 ```bash
-npm install hiapi
+npm install hiapi_ai
 ```
 
 Requires Node.js 18.17+. On Node 18–20, the first request prints a one-time
@@ -25,8 +25,8 @@ this package, and is harmless.
 ## Quick start
 
 ```js
-import { HiAPI } from "hiapi";
-// CommonJS works too: const { HiAPI } = require("hiapi");
+import { HiAPI } from "hiapi_ai";
+// CommonJS works too: const { HiAPI } = require("hiapi_ai");
 
 const client = new HiAPI({ apiKey: "sk-..." }); // or set HIAPI_API_KEY
 
@@ -149,7 +149,7 @@ signed. Verify them against the **raw request body**:
 
 ```js
 import { createServer } from "node:http";
-import { HiAPI, WebhookVerificationError } from "hiapi";
+import { HiAPI, WebhookVerificationError } from "hiapi_ai";
 
 const client = new HiAPI({ apiKey: "sk-...", webhookSecret: "whsec_..." });
 const MAX_BODY = 1024 * 1024; // 1 MiB — reject oversized bodies before verifying

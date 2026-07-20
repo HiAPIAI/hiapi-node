@@ -6,11 +6,11 @@
 const assert = require("node:assert/strict");
 const path = require("node:path");
 
-const { APIError, HiAPI, HiAPIError, Task, VERSION, verifyWebhook } = require("hiapi");
+const { APIError, HiAPI, HiAPIError, Task, VERSION, verifyWebhook } = require("hiapi_ai");
 
 const pkg = require(path.join(__dirname, "..", "package.json"));
 assert.equal(VERSION, pkg.version);
-assert.equal(pkg.name, "hiapi");
+assert.equal(pkg.name, "hiapi_ai");
 assert.equal(typeof HiAPI, "function");
 assert.equal(typeof verifyWebhook, "function");
 assert.ok(new HiAPIError("x") instanceof Error);

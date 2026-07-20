@@ -1,5 +1,5 @@
 {
-  "name": "hiapi",
+  "name": "hiapi_ai",
   "version": "0.2.1",
   "description": "Zero-dependency Node.js client for the HiAPI unified async task API (/v1/tasks).",
   "keywords": [

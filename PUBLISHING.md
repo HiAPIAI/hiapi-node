@@ -1,4 +1,4 @@
-# Publishing `hiapi` to npm
+# Publishing `hiapi_ai` to npm
 
 The package builds ESM + CJS + type declarations via `prepack`, so a plain
 `npm publish` ships a complete artifact. Tests gate every path.
@@ -16,7 +16,7 @@ npm login
 npm publish --access public
 
 # 4. Verify.
-npm view hiapi version
+npm view hiapi_ai version
 ```
 
 ## Later releases (CI, triggered by pushing to main)
