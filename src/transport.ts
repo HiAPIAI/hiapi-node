@@ -448,7 +448,7 @@ export function retryDelayMs(attempt: number, headers: Headers | null): number {
 
 export function normalizeBaseUrl(baseUrl: string): string {
   // Strip trailing slashes and ensure the `/v1` version prefix is present, so
-  // both `https://api.hiapi.ai` and `https://api.hiapi.ai/v1` work rather than
+  // both `https://api.hiapi.sh` and `https://api.hiapi.sh/v1` work rather than
   // a missing `/v1` silently sending requests to the wrong path.
   let base = baseUrl.replace(/\/+$/, "");
   if (!base.endsWith("/v1")) {

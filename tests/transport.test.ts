@@ -69,10 +69,10 @@ describe("request framing", () => {
   });
 
   test("normalizeBaseUrl handles bare and versioned forms", () => {
-    assert.equal(normalizeBaseUrl("https://api.hiapi.ai"), "https://api.hiapi.ai/v1");
-    assert.equal(normalizeBaseUrl("https://api.hiapi.ai/"), "https://api.hiapi.ai/v1");
-    assert.equal(normalizeBaseUrl("https://api.hiapi.ai/v1"), "https://api.hiapi.ai/v1");
-    assert.equal(normalizeBaseUrl("https://api.hiapi.ai/v1//"), "https://api.hiapi.ai/v1");
+    assert.equal(normalizeBaseUrl("https://api.hiapi.sh"), "https://api.hiapi.sh/v1");
+    assert.equal(normalizeBaseUrl("https://api.hiapi.sh/"), "https://api.hiapi.sh/v1");
+    assert.equal(normalizeBaseUrl("https://api.hiapi.sh/v1"), "https://api.hiapi.sh/v1");
+    assert.equal(normalizeBaseUrl("https://api.hiapi.sh/v1//"), "https://api.hiapi.sh/v1");
   });
 
   test("query params are encoded and undefined values dropped", async () => {

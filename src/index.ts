@@ -6,7 +6,7 @@
  *
  * const client = new HiAPI({ apiKey: "sk-..." }); // or set HIAPI_API_KEY
  * const task = await client.tasks.run({
- *   model: "seedance-2-0",
+ *   model: "seedance-2.0",
  *   input: { prompt: "...", resolution: "1080p" },
  * });
  * console.log(task.output[0].url);

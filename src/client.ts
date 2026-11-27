@@ -6,14 +6,14 @@ import { Transport } from "./transport.js";
 import type { FetchLike } from "./transport.js";
 import { Webhooks } from "./webhooks.js";
 
-export const DEFAULT_BASE_URL = "https://api.hiapi.ai/v1";
+export const DEFAULT_BASE_URL = "https://api.hiapi.sh/v1";
 export const DEFAULT_TIMEOUT_MS = 60_000;
 export const DEFAULT_MAX_RETRIES = 2;
 
 export interface HiAPIOptions {
   /** Account API key (`sk-...`). Falls back to the `HIAPI_API_KEY` environment variable. */
   apiKey?: string;
-  /** API base URL, including the `/v1` prefix. */
+  /** API base URL, including the `/v1` prefix. Falls back to the `HIAPI_BASE_URL` environment variable, then the default. */
   baseUrl?: string;
   /** Per-request timeout in milliseconds. Default 60000. */
   timeoutMs?: number;
@@ -43,7 +43,7 @@ export interface HiAPIOptions {
  *
  * const client = new HiAPI({ apiKey: "sk-..." }); // or set HIAPI_API_KEY
  * const task = await client.tasks.run({
- *   model: "seedance-2-0",
+ *   model: "seedance-2.0",
  *   input: { prompt: "a cyan glass data center", resolution: "1080p" },
  *   onUpdate: (t) => console.log(t.status),
  * });
@@ -67,7 +67,7 @@ export class HiAPI {
         "missing API key: pass apiKey or set the HIAPI_API_KEY environment variable",
       );
     }
-    this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+    this.baseUrl = options.baseUrl ?? (process.env.HIAPI_BASE_URL || DEFAULT_BASE_URL);
     const transport = new Transport(
       key,
       this.baseUrl,

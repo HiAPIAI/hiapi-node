@@ -6,6 +6,23 @@ import { DEFAULT_BASE_URL, HiAPI, HiAPIError, VERSION } from "../src/index.js";
 import type { FetchLike } from "../src/index.js";
 
 describe("client construction", () => {
+  test("baseUrl priority: option > HIAPI_BASE_URL > default", () => {
+    const prev = process.env.HIAPI_BASE_URL;
+    try {
+      process.env.HIAPI_BASE_URL = "https://env.example.com/v1";
+      assert.equal(new HiAPI({ apiKey: "sk" }).baseUrl, "https://env.example.com/v1");
+      assert.equal(
+        new HiAPI({ apiKey: "sk", baseUrl: "https://opt.example.com/v1" }).baseUrl,
+        "https://opt.example.com/v1",
+      );
+      delete process.env.HIAPI_BASE_URL;
+      assert.equal(new HiAPI({ apiKey: "sk" }).baseUrl, DEFAULT_BASE_URL);
+    } finally {
+      if (prev === undefined) delete process.env.HIAPI_BASE_URL;
+      else process.env.HIAPI_BASE_URL = prev;
+    }
+  });
+
   test("throws a clear error when no API key is available", () => {
     const prev = process.env.HIAPI_API_KEY;
     delete process.env.HIAPI_API_KEY;
