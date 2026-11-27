@@ -106,12 +106,12 @@ async function run(): Promise<void> {
   const input: SeedanceInput = { prompt: "x", resolution: "1080p" };
 
   // Direct call site — plain \`object\` constraint, no cast needed.
-  const created = await client.tasks.create({ model: "seedance-2-0", input });
+  const created = await client.tasks.create({ model: "seedance-2.0", input });
 
   // Pre-declared variable typed as the exported CreateTaskParams — a generic
   // default type parameter would NOT fix this (inference only applies at a
   // call site), which is why input is plain \`object\` rather than generic.
-  const params: CreateTaskParams = { model: "seedance-2-0", input, storage: "persistent" };
+  const params: CreateTaskParams = { model: "seedance-2.0", input, storage: "persistent" };
   await client.tasks.create(params);
 
   // Same named-interface-without-index-signature shape, through the
@@ -121,7 +121,7 @@ async function run(): Promise<void> {
     when: "final";
   }
   const callback: CallbackConfig = { url: "https://example.com/cb", when: "final" };
-  await client.tasks.create({ model: "seedance-2-0", input, callback });
+  await client.tasks.create({ model: "seedance-2.0", input, callback });
 
   console.log(created.taskId);
 }

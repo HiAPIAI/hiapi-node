@@ -130,7 +130,7 @@ describe("tasks.create", () => {
   test("a named interface (no index signature) is accepted as input without a cast", async () => {
     mock.reset(() => jsonReply({ data: { taskId: "t" } }));
     const input: SeedanceInput = { prompt: "a cyan glass data center", resolution: "1080p" };
-    const created = await client().tasks.create({ model: "seedance-2-0", input });
+    const created = await client().tasks.create({ model: "seedance-2.0", input });
     assert.equal(created.taskId, "t");
     assert.deepEqual(JSON.parse(mock.requests[0].body).input, input);
   });

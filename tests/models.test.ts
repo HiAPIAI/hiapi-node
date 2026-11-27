@@ -7,7 +7,7 @@ describe("Task.fromJSON", () => {
   test("parses a full payload and keeps unknown fields in raw", () => {
     const wire = {
       taskId: "t1",
-      model: "seedance-2-0",
+      model: "seedance-2.0",
       status: "success",
       created: 1700000000,
       completed: 1700000100,
@@ -18,7 +18,7 @@ describe("Task.fromJSON", () => {
     };
     const task = Task.fromJSON(wire);
     assert.equal(task.taskId, "t1");
-    assert.equal(task.model, "seedance-2-0");
+    assert.equal(task.model, "seedance-2.0");
     assert.equal(task.createdAt, 1700000000);
     assert.equal(task.completedAt, 1700000100);
     assert.equal(task.storage, "temp");

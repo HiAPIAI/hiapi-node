@@ -28,6 +28,6 @@ assert.ok(APIError.prototype instanceof HiAPIError);
 assert.equal(typeof Task, "function");
 
 const client = new HiAPI({ apiKey: "sk-smoke-test" });
-assert.equal(client.baseUrl, "https://api.hiapi.ai/v1");
+assert.equal(client.baseUrl, "https://api.hiapi.sh/v1");
 
 console.log("smoke:esm ok —", VERSION);

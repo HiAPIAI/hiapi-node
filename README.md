@@ -8,7 +8,7 @@ Zero-dependency Node.js client for the [HiAPI](https://hiapi.ai) **unified async
 - **Webhook verification.** HMAC-SHA256 signature + timestamp freshness check, built in (still deduplicate deliveries by task id).
 
 > For OpenAI-compatible chat/image endpoints, keep using the `openai` library with
-> `baseURL: "https://api.hiapi.ai/v1"`. This SDK focuses on what the OpenAI client
+> `baseURL: "https://api.hiapi.sh/v1"`. This SDK focuses on what the OpenAI client
 > can't do: the asynchronous **submit → poll → retrieve** lifecycle (results come back as output URLs).
 
 ## Install
@@ -31,7 +31,7 @@ import { HiAPI } from "hiapi_ai";
 const client = new HiAPI({ apiKey: "sk-..." }); // or set HIAPI_API_KEY
 
 const task = await client.tasks.run({
-  model: "seedance-2-0",
+  model: "seedance-2.0",
   input: { prompt: "a cyan glass data center entrance", resolution: "1080p" },
   onUpdate: (t) => console.log("status:", t.status),
 });
@@ -60,7 +60,7 @@ bound it with `signal`:
 
 ```js
 const task = await client.tasks.run({
-  model: "seedance-2-0",
+  model: "seedance-2.0",
   input: { prompt: "..." },
   signal: AbortSignal.timeout(120_000), // also bounds a hanging onUpdate
   onUpdate: async (t) => {
@@ -83,7 +83,7 @@ fact — see the [Output Storage docs](https://docs.hiapi.ai/storage/).
 
 ```js
 const created = await client.tasks.create({
-  model: "seedance-2-0",
+  model: "seedance-2.0",
   input: { prompt: "...", resolution: "720p" },
   callback: { url: "https://your-app.com/hiapi/callback", when: "final" },
 });
@@ -127,7 +127,7 @@ request creates a new task):
 
 ```js
 const created = await client.tasks.create({
-  model: "seedance-2-0",
+  model: "seedance-2.0",
   input: { prompt: "..." },
   idempotencyKey: "order-8472:video", // a stable key you derive per job
 });
@@ -237,7 +237,7 @@ retry automatically on that basis. For anything automated, submit with an
 ```js
 new HiAPI({
   apiKey: undefined,                  // falls back to HIAPI_API_KEY
-  baseUrl: "https://api.hiapi.ai/v1",
+  baseUrl: "https://api.hiapi.sh/v1",   // falls back to HIAPI_BASE_URL
   timeoutMs: 60_000,                  // per-request
   maxRetries: 2,
   webhookSecret: undefined,           // falls back to HIAPI_WEBHOOK_SECRET
